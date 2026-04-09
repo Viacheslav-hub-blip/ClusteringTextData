@@ -50,10 +50,12 @@ class GroupNameGenerator:
         try:
             raw = self._specific_chain.invoke(
                 {
+                    "raw_text": frame.raw_text,
                     "general_topic": frame.general_topic,
                     "exact_case": frame.exact_case,
                     "key_qualifiers": frame.key_qualifiers,
                     "entities": frame.entities,
+                    "canonical_key": frame.canonical_key,
                 }
             )
             return str(raw.get("group_name", frame.general_topic or frame.exact_case)).strip()
@@ -63,20 +65,20 @@ class GroupNameGenerator:
 
     def generate_parent_group(
         self,
-        specific_groups: list[str],
+        child_cluster_descriptions: list[str],
         general_topics: list[str],
     ) -> str:
         """Generate label for a parent cluster."""
         try:
             raw = self._parent_chain.invoke(
                 {
-                    "specific_groups": "\n".join(f"- {name}" for name in specific_groups),
-                    "general_topics": "\n".join(f"- {topic}" for topic in general_topics),
+                    "child_clusters": "\n\n".join(child_cluster_descriptions),
                 }
             )
-            return str(raw.get("group_name", general_topics[0] if general_topics else specific_groups[0])).strip()
+            fallback = general_topics[0] if general_topics else child_cluster_descriptions[0]
+            return str(raw.get("group_name", fallback)).strip()
         except Exception as exc:
             logger.error("Parent group naming failed: %s", exc)
             if general_topics:
                 return general_topics[0]
-            return specific_groups[0]
+            return child_cluster_descriptions[0]

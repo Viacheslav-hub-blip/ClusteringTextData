@@ -109,17 +109,27 @@ class UniversalTextClusteringPipeline:
 
         logger.info("Stage 6/6: naming and label assignment")
         for parent_cluster in parent_clusters:
-            child_specific_groups: list[str] = []
+            child_cluster_descriptions: list[str] = []
             child_general_topics: list[str] = []
 
             for specific_cluster_id in parent_cluster.child_specific_cluster_ids:
                 specific_cluster = specific_clusters_by_id[specific_cluster_id]
-                child_specific_groups.append(specific_cluster.specific_group)
                 frame = prototypes_by_id[specific_cluster.representative_prototype_id].representative_frame
                 child_general_topics.append(frame.general_topic)
+                child_cluster_descriptions.append(
+                    "\n".join(
+                        [
+                            f"- specific_group: {specific_cluster.specific_group}",
+                            f"- general_topic: {frame.general_topic}",
+                            f"- exact_case: {frame.exact_case}",
+                            f"- key_qualifiers: {frame.key_qualifiers}",
+                            f"- entities: {frame.entities}",
+                        ]
+                    )
+                )
 
             parent_cluster.parent_group = self._name_generator.generate_parent_group(
-                specific_groups=child_specific_groups,
+                child_cluster_descriptions=child_cluster_descriptions,
                 general_topics=child_general_topics,
             )
 
