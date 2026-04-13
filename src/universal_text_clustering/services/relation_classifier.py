@@ -44,13 +44,19 @@ class PairRelationClassifier:
             raw = self._chain.invoke(
                 {
                     "topic_a": left_frame.general_topic,
+                    "parent_key_a": left_frame.parent_key,
+                    "core_case_a": left_frame.core_case,
                     "exact_case_a": left_frame.exact_case,
                     "qualifiers_a": left_frame.key_qualifiers,
+                    "context_details_a": left_frame.context_details,
                     "entities_a": left_frame.entities,
                     "canonical_key_a": left_frame.canonical_key,
                     "topic_b": right_frame.general_topic,
+                    "parent_key_b": right_frame.parent_key,
+                    "core_case_b": right_frame.core_case,
                     "exact_case_b": right_frame.exact_case,
                     "qualifiers_b": right_frame.key_qualifiers,
+                    "context_details_b": right_frame.context_details,
                     "entities_b": right_frame.entities,
                     "canonical_key_b": right_frame.canonical_key,
                 }

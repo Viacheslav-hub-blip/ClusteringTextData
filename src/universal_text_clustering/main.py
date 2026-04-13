@@ -25,7 +25,6 @@ except ImportError:
         sys.path.insert(0, str(src_dir))
     from src.model import embeddings, model as llm
 
-
 DEMO_COMMENTS = [
     {"comment_id": "c1", "text": "Не могу перевести деньги"},
     {"comment_id": "c2", "text": "Не проходит перевод между своими счетами"},
@@ -48,6 +47,7 @@ def configure_logging() -> None:
 
 
 def main() -> None:
+    import pandas as pd
     """Run the universal pipeline on demo data."""
     configure_logging()
     pipeline = UniversalTextClusteringPipeline(
@@ -56,7 +56,13 @@ def main() -> None:
         extraction_batch_size=50,
         dense_top_k=10,
     )
-    result = pipeline.run(DEMO_COMMENTS)
+    df = pd.read_excel(r"C:\Users\Slav4ik\PycharmProjects\ClusteringTextData\data\comments_1000.xlsx")
+    # print(df)
+    df_comments = [
+        {"comment_id": str(row["comment_id"]), "text": row["comment"]} for idx, row in df.iterrows()
+    ]
+    # print(df_comments)
+    result = pipeline.run(df_comments[:50])
     print(json.dumps(result, ensure_ascii=False, indent=2))
 
 

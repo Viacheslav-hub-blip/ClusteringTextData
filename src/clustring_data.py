@@ -28,6 +28,7 @@ from langchain_core.embeddings import Embeddings
 from pydantic import BaseModel, Field
 
 try:
+    from .label_consolidation import SemanticLabelConsolidator
     from .prompts import (
         NAMING_HUMAN_PARENT,
         NAMING_HUMAN_SPECIFIC,
@@ -38,6 +39,7 @@ try:
         SEMANTIC_EXTRACTION_SYSTEM,
     )
 except ImportError:
+    from label_consolidation import SemanticLabelConsolidator
     from prompts import (
         NAMING_HUMAN_PARENT,
         NAMING_HUMAN_SPECIFIC,
@@ -237,7 +239,7 @@ class SemanticExtractor:
                         SemanticRepresentation(
                             comment_id=comment.comment_id,
                             normalized_text=comment.text,
-                            general_topic="Неизвестная тема",
+                            general_topic="Не определено",
                             exact_case=comment.text,
                             key_qualifiers=[],
                             canonical_key=comment.text.lower().strip(),
@@ -441,6 +443,41 @@ class GroupNameGenerator:
                 self._parent_prompt | self._llm | self._parser
         )
 
+        self._specific_reconciliation_prompt = ChatPromptTemplate.from_messages([
+            (
+                "system",
+                """
+Ты проверяешь уже созданные конкретные группы и приводишь синонимичные specific_group к одному виду.
+
+Правила:
+- Не используй заранее заданный справочник категорий.
+- Если несколько specific_group описывают один и тот же основной кейс, верни для них одинаковое название.
+- Если названия отличаются только реакцией пользователя, желаемым действием, эмоцией, оценкой пользы или локальной деталью, объедини их в одну устойчивую формулировку про источник проблемы.
+- Если названия описывают разные действия, объекты или явно разные сущности, оставь их разными.
+- Если данных недостаточно для полезного названия, используй "Не определено".
+
+Верни только валидный JSON без markdown.
+""",
+            ),
+            (
+                "human",
+                """
+Конкретные кластеры:
+{specific_clusters}
+
+Верни JSON:
+{{
+  "items": [
+    {{"cluster_id": "...", "specific_group": "..."}}
+  ]
+}}
+""",
+            ),
+        ])
+        self._specific_reconciliation_chain = (
+                self._specific_reconciliation_prompt | self._llm | self._parser
+        )
+
     def generate_specific_name(
             self, repr_: SemanticRepresentation
     ) -> str:
@@ -478,7 +515,38 @@ class GroupNameGenerator:
             logger.error(
                 "GroupNameGenerator (parent): ошибка: %s", exc
             )
-            return specific_group_names[0] if specific_group_names else "Прочее"
+            return specific_group_names[0] if specific_group_names else "Не определено"
+
+    def reconcile_specific_names(
+            self,
+            cluster_descriptions: list[str],
+    ) -> dict[str, str]:
+        """Приводит синонимичные specific_group к одному имени без справочника."""
+        if not cluster_descriptions:
+            return {}
+
+        try:
+            raw = self._specific_reconciliation_chain.invoke({
+                "specific_clusters": "\n\n".join(cluster_descriptions),
+            })
+            items = raw.get("items", [])
+            if not isinstance(items, list):
+                return {}
+
+            result: dict[str, str] = {}
+            for item in items:
+                if not isinstance(item, dict):
+                    continue
+                cluster_id = str(item.get("cluster_id", "")).strip()
+                specific_group = str(item.get("specific_group", "")).strip()
+                if cluster_id and specific_group:
+                    result[cluster_id] = specific_group
+            return result
+        except Exception as exc:
+            logger.error(
+                "GroupNameGenerator (specific reconciliation): ошибка: %s", exc
+            )
+            return {}
 
 
 class ClusterBuilder:
@@ -500,6 +568,14 @@ class ClusterBuilder:
     ):
         self._classifier = classifier
         self._name_generator = name_generator
+
+    @staticmethod
+    def _normalize_taxonomy_key(value: str) -> str:
+        """Normalize model-produced taxonomy text without mapping to fixed labels."""
+        value = value.strip().lower()
+        value = re.sub(r"[^\w\s-]+", " ", value, flags=re.UNICODE)
+        value = re.sub(r"\s+", " ", value).strip()
+        return value
 
     def build_clusters(
             self,
@@ -614,6 +690,28 @@ class ClusterBuilder:
                 general_topics=[cluster.prototype_repr.general_topic],
             )
 
+        if len(cluster_map) > 1:
+            specific_reconciliation_input: list[str] = []
+            for root, cluster in cluster_map.items():
+                specific_reconciliation_input.append(
+                    "\n".join(
+                        [
+                            f"cluster_id: {root}",
+                            f"current_specific_group: {cluster.specific_group_name}",
+                            f"general_topic: {cluster.prototype_repr.general_topic}",
+                            f"exact_case: {cluster.prototype_repr.exact_case}",
+                            f"key_qualifiers: {cluster.prototype_repr.key_qualifiers}",
+                            f"canonical_key: {cluster.prototype_repr.canonical_key}",
+                        ]
+                    )
+                )
+            reconciled_specific_names = self._name_generator.reconcile_specific_names(
+                specific_reconciliation_input
+            )
+            for root, specific_group_name in reconciled_specific_names.items():
+                if root in cluster_map:
+                    cluster_map[root].specific_group_name = specific_group_name
+
         # Шаг 5: Формируем родительские группы
         # Нормализуем SPECIFIC_OF-ссылки к root
         parent_groups: dict[str, str] = {}  # root → parent_root
@@ -687,6 +785,30 @@ class ClusterBuilder:
                         cluster_map[parent_root].parent_group_name
                     )
 
+        # Дополнительная сверка sibling-кластеров по data-driven general_topic.
+        # Это снижает риск синонимичных parent_group без заранее заданного справочника.
+        roots_by_general_topic: dict[str, list[str]] = {}
+        for root, cluster in cluster_map.items():
+            topic_key = self._normalize_taxonomy_key(
+                cluster.prototype_repr.general_topic
+            )
+            if topic_key and topic_key != "не определено":
+                roots_by_general_topic.setdefault(topic_key, []).append(root)
+
+        for roots in roots_by_general_topic.values():
+            if len(roots) < 2:
+                continue
+            parent_name = self._name_generator.generate_parent_name(
+                specific_group_names=[
+                    cluster_map[root].specific_group_name for root in roots
+                ],
+                general_topics=[
+                    cluster_map[root].prototype_repr.general_topic for root in roots
+                ],
+            )
+            for root in roots:
+                cluster_map[root].parent_group_name = parent_name
+
         return list(cluster_map.values())
 
 
@@ -750,6 +872,7 @@ class CommentGroupingPipeline:
         self._cluster_builder = ClusterBuilder(
             self._pair_classifier, self._name_generator
         )
+        self._label_consolidator = SemanticLabelConsolidator(embeddings)
         self._label_assigner = LabelAssigner()
         self._extraction_batch_size = extraction_batch_size
 
@@ -795,6 +918,54 @@ class CommentGroupingPipeline:
         )
         clusters = self._cluster_builder.build_clusters(prototypes, candidates)
 
+        consolidated_specific_names = self._label_consolidator.consolidate(
+            clusters,
+            item_id_getter=lambda cluster: cluster.cluster_id,
+            label_getter=lambda cluster: cluster.specific_group_name,
+            semantic_text_getter=lambda cluster: " | ".join(
+                [
+                    cluster.specific_group_name,
+                    cluster.prototype_repr.general_topic,
+                    cluster.prototype_repr.exact_case,
+                    " ".join(cluster.prototype_repr.key_qualifiers),
+                    cluster.prototype_repr.canonical_key,
+                ]
+            ),
+            family_key_getter=lambda cluster: cluster.prototype_repr.general_topic,
+            size_getter=lambda cluster: len(cluster.member_ids),
+            min_similarity=0.90,
+            min_token_overlap=0.5,
+        )
+        for cluster in clusters:
+            consolidated_specific_name = consolidated_specific_names.get(
+                cluster.cluster_id
+            )
+            if consolidated_specific_name:
+                cluster.specific_group_name = consolidated_specific_name
+
+        consolidated_parent_names = self._label_consolidator.consolidate(
+            clusters,
+            item_id_getter=lambda cluster: cluster.cluster_id,
+            label_getter=lambda cluster: cluster.parent_group_name,
+            semantic_text_getter=lambda cluster: " | ".join(
+                [
+                    cluster.parent_group_name,
+                    cluster.prototype_repr.general_topic,
+                    cluster.specific_group_name,
+                ]
+            ),
+            family_key_getter=lambda cluster: cluster.prototype_repr.general_topic,
+            size_getter=lambda cluster: len(cluster.member_ids),
+            min_similarity=0.90,
+            min_token_overlap=0.5,
+        )
+        for cluster in clusters:
+            consolidated_parent_name = consolidated_parent_names.get(
+                cluster.cluster_id
+            )
+            if consolidated_parent_name:
+                cluster.parent_group_name = consolidated_parent_name
+
         # Этап 9: Присвоение меток
         logger.info("Pipeline: Этап 9 — присвоение итоговых меток")
         label_map = self._label_assigner.assign(clusters)
@@ -813,8 +984,8 @@ class CommentGroupingPipeline:
                 )
                 output.append({
                     "comment_id": comment.comment_id,
-                    "specific_group": "Ошибка классификации",
-                    "parent_group": "Ошибка классификации",
+                    "specific_group": "Не определено",
+                    "parent_group": "Не определено",
                 })
 
         logger.info(

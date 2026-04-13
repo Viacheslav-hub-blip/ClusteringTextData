@@ -30,35 +30,48 @@ class SemanticExtractor:
             | self._parser
         )
 
+    @staticmethod
+    def _as_clean_list(value: object) -> list[str]:
+        """Return a clean list even if the LLM sends a scalar value."""
+        if value is None:
+            return []
+        if isinstance(value, list):
+            items = value
+        else:
+            items = [value]
+        return [str(item).strip() for item in items if str(item).strip()]
+
     def extract_one(self, comment: InputComment) -> SemanticFrame:
         """Extract one semantic frame."""
         try:
             raw = self._chain.invoke({"text": comment.text})
+            general_topic = str(raw.get("general_topic", "")).strip()
+            exact_case = str(raw.get("exact_case", "")).strip()
+            core_case = str(raw.get("core_case", exact_case)).strip()
+            parent_key = str(raw.get("parent_key", general_topic)).strip().lower()
             return SemanticFrame(
                 comment_id=comment.comment_id,
                 raw_text=comment.text,
-                general_topic=str(raw.get("general_topic", "")).strip(),
-                exact_case=str(raw.get("exact_case", "")).strip(),
-                key_qualifiers=[
-                    str(item).strip()
-                    for item in raw.get("key_qualifiers", [])
-                    if str(item).strip()
-                ],
-                entities=[
-                    str(item).strip()
-                    for item in raw.get("entities", [])
-                    if str(item).strip()
-                ],
-                canonical_key=str(raw.get("canonical_key", "")).strip().lower(),
+                general_topic=general_topic,
+                parent_key=parent_key,
+                core_case=core_case,
+                exact_case=exact_case,
+                key_qualifiers=self._as_clean_list(raw.get("key_qualifiers", [])),
+                context_details=self._as_clean_list(raw.get("context_details", [])),
+                entities=self._as_clean_list(raw.get("entities", [])),
+                canonical_key=str(raw.get("canonical_key", core_case)).strip().lower(),
             )
         except Exception as exc:
             logger.error("Semantic extraction failed for %s: %s", comment.comment_id, exc)
             return SemanticFrame(
                 comment_id=comment.comment_id,
                 raw_text=comment.text,
-                general_topic="Неизвестная тема",
+                general_topic="Не определено",
+                parent_key="не определено",
+                core_case="Не определено",
                 exact_case=comment.text,
                 key_qualifiers=[],
+                context_details=[],
                 entities=[],
                 canonical_key=comment.text.strip().lower(),
             )

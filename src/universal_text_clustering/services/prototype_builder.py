@@ -17,7 +17,12 @@ class PrototypeBuilder:
         """Group frames by canonical key and return prototypes plus comment mapping."""
         groups: dict[str, list[SemanticFrame]] = defaultdict(list)
         for frame in frames:
-            key = frame.canonical_key or frame.raw_text.strip().lower()
+            key = (
+                frame.canonical_key
+                or frame.core_case.strip().lower()
+                or frame.exact_case.strip().lower()
+                or frame.raw_text.strip().lower()
+            )
             groups[key].append(frame)
 
         prototypes: list[Prototype] = []

@@ -25,8 +25,11 @@ class DensePrototypeRetriever:
         return " | ".join(
             [
                 frame.general_topic,
+                frame.parent_key,
+                frame.core_case,
                 frame.exact_case,
                 " ".join(frame.key_qualifiers),
+                " ".join(frame.context_details),
                 " ".join(frame.entities),
                 frame.canonical_key,
             ]

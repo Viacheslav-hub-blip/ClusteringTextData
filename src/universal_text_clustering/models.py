@@ -31,8 +31,11 @@ class SemanticFrame:
     comment_id: str
     raw_text: str
     general_topic: str
+    parent_key: str
+    core_case: str
     exact_case: str
     key_qualifiers: list[str]
+    context_details: list[str]
     entities: list[str]
     canonical_key: str
 
