@@ -51,6 +51,14 @@ _QUOTE_MAP = str.maketrans(
 )
 
 
+def render_progress_bar(current: int, total: int, *, width: int = 24) -> str:
+    """Render a compact ASCII progress bar for console output."""
+    total = max(total, 1)
+    current = max(0, min(current, total))
+    filled = int(width * current / total)
+    return f"[{'#' * filled}{'.' * (width - filled)}] {current}/{total}"
+
+
 def technical_normalize_text(value: str) -> str:
     """Apply safe technical normalization without changing the meaning."""
     value = str(value).translate(_QUOTE_MAP)
@@ -596,9 +604,11 @@ class IncrementalMVPClusteringPipeline:
         primary_similarity_threshold: float = 0.92,
         verification_similarity_threshold: float = 0.90,
         max_concurrent_llm_requests: int = 10,
+        max_concurrent_embedding_requests: int = 10,
     ):
         self._embeddings = embeddings
         self._llm_semaphore = asyncio.Semaphore(max_concurrent_llm_requests)
+        self._embedding_semaphore = asyncio.Semaphore(max_concurrent_embedding_requests)
         self._normalizer = CommentNormalizer(
             llm,
             min_meaningful_length=min_meaningful_length,
@@ -621,6 +631,7 @@ class IncrementalMVPClusteringPipeline:
         self._primary_similarity_threshold = primary_similarity_threshold
         self._verification_similarity_threshold = verification_similarity_threshold
         self._max_concurrent_llm_requests = max_concurrent_llm_requests
+        self._max_concurrent_embedding_requests = max_concurrent_embedding_requests
 
     def run(self, raw_comments: list[dict]) -> dict[str, list[dict]]:
         return asyncio.run(self.arun(raw_comments))
@@ -629,15 +640,27 @@ class IncrementalMVPClusteringPipeline:
         """Process comments incrementally and return comments plus final groups."""
         comments = self._validate(raw_comments)
         logger.info("Incremental MVP pipeline started: %d comments", len(comments))
+        self._print_stage("Подготовка комментариев", 0, len(comments))
 
         prepared_comments = await asyncio.gather(
             *(self._prepare_comment(comment) for comment in comments)
         )
-        for comment, normalization, embedding in prepared_comments:
-            await self._process_comment(comment, normalization, embedding)
+        self._print_stage("Подготовка комментариев", len(comments), len(comments))
 
+        total_comments = len(prepared_comments)
+        progress_step = self._progress_step(total_comments)
+        self._print_stage("Инкрементальная кластеризация", 0, total_comments)
+        for index, (comment, normalization, embedding) in enumerate(prepared_comments, start=1):
+            await self._process_comment(comment, normalization, embedding)
+            if index == 1 or index == total_comments or index % progress_step == 0:
+                self._print_stage("Инкрементальная кластеризация", index, total_comments)
+
+        self._print_stage("Нейминг групп", 0, len(self._store.all_groups()))
         await self._generate_group_names()
+        self._print_stage("Нейминг групп", len(self._store.all_groups()), len(self._store.all_groups()))
+        self._print_message("Слияние групп с одинаковыми именами")
         self._store.merge_groups_by_name()
+        self._print_message("Пайплайн завершен")
 
         return {
             "comments": self._store.comment_outputs(),
@@ -657,7 +680,6 @@ class IncrementalMVPClusteringPipeline:
         self,
         comment: InputComment,
     ) -> tuple[InputComment, NormalizationResult, list[float] | None]:
-        logger.info("Processing comment %s", comment.comment_id)
         normalization = await self._normalizer.anormalize(comment.text)
         embedding = None
         if normalization.is_meaningful:
@@ -759,7 +781,8 @@ class IncrementalMVPClusteringPipeline:
 
     async def _build_embedding(self, normalized_text: str) -> list[float] | None:
         try:
-            return list(await self._embeddings.aembed_query(normalized_text))
+            async with self._embedding_semaphore:
+                return list(await self._embeddings.aembed_query(normalized_text))
         except Exception as exc:
             logger.error("Embedding generation failed: %s", exc)
             return None
@@ -888,7 +911,17 @@ class IncrementalMVPClusteringPipeline:
         return VerificationDecision(passed=passed, reason=reason)
 
     async def _generate_group_names(self) -> None:
+        groups = self._store.all_groups()
+        if not groups:
+            return
+
+        completed = 0
+        total = len(groups)
+        progress_step = self._progress_step(total)
+        progress_lock = asyncio.Lock()
+
         async def assign_group_name(group: CommentGroup) -> None:
+            nonlocal completed
             representatives = self._store.unique_group_comments(group.group_id)
             examples_text = self._format_group_examples(representatives)
             fallback_name = self._fallback_group_name(representatives)
@@ -896,8 +929,12 @@ class IncrementalMVPClusteringPipeline:
                 examples_text=examples_text,
                 fallback_name=fallback_name,
             )
+            async with progress_lock:
+                completed += 1
+                if completed == 1 or completed == total or completed % progress_step == 0:
+                    self._print_stage("Нейминг групп", completed, total)
 
-        await asyncio.gather(*(assign_group_name(group) for group in self._store.all_groups()))
+        await asyncio.gather(*(assign_group_name(group) for group in groups))
 
     @staticmethod
     def _fallback_group_name(representatives: list[StoredComment]) -> str:
@@ -943,3 +980,15 @@ class IncrementalMVPClusteringPipeline:
                 for comment in comments
             ]
         )
+
+    @staticmethod
+    def _progress_step(total: int) -> int:
+        return max(1, total // 10)
+
+    @staticmethod
+    def _print_message(message: str) -> None:
+        print(f"\r{message}".ljust(80))
+
+    @staticmethod
+    def _print_stage(stage: str, current: int, total: int) -> None:
+        print(f"\r{stage}: {render_progress_bar(current, total)}".ljust(80))
