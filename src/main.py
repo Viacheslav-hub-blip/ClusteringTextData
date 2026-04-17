@@ -41,9 +41,32 @@ def build_console_output(result: dict) -> dict:
         {key: value for key, value in comment.items() if key != "embedding"}
         for comment in result.get("comments", [])
     ]
+    comments_by_group_id: dict[str, list[dict]] = {}
+    for comment in comments:
+        group_id = str(comment.get("group_id", "")).strip()
+        if not group_id:
+            continue
+        comments_by_group_id.setdefault(group_id, []).append(
+            {
+                "comment_id": comment["comment_id"],
+                "raw_text": comment["raw_text"],
+                "normalized_text": comment["normalized_text"],
+            }
+        )
+
+    groups = []
+    for group in result.get("groups", []):
+        group_id = group.get("group_id", "")
+        groups.append(
+            {
+                **group,
+                "member_comments": comments_by_group_id.get(group_id, []),
+            }
+        )
+
     return {
         "comments": comments,
-        "groups": result.get("groups", []),
+        "groups": groups,
     }
 
 

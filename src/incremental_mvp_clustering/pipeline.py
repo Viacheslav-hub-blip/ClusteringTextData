@@ -2,11 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
-import math
 import re
 
 from langchain_community.vectorstores import FAISS
+from langchain_community.vectorstores.faiss import DistanceStrategy
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import JsonOutputParser
@@ -48,65 +49,19 @@ _QUOTE_MAP = str.maketrans(
         "\u2013": "-",
     }
 )
-_NON_INFORMATIVE_TOKENS = {
-    "а",
-    "ага",
-    "ок",
-    "окей",
-    "угу",
-    "мм",
-    "эм",
-    "хм",
-    "спс",
-    "спасибо",
-    "понял",
-    "понятно",
-    "ясно",
-    "норм",
-    "нормально",
-    "класс",
-    "жесть",
-    "мда",
-    "лол",
-    "test",
-    "testing",
-}
 
 
 def technical_normalize_text(value: str) -> str:
     """Apply safe technical normalization without changing the meaning."""
     value = str(value).translate(_QUOTE_MAP)
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def normalize_for_match(value: str) -> str:
-    """Normalize text for comparisons and lightweight heuristics."""
+    """Normalize text for stable string comparison."""
     value = technical_normalize_text(value).lower().replace("ё", "е")
     value = re.sub(r"[^0-9a-zа-я\s-]+", " ", value, flags=re.IGNORECASE)
-    value = re.sub(r"\s+", " ", value).strip()
-    return value
-
-
-def token_overlap(left: str, right: str) -> float:
-    """Compute token overlap relative to the smaller token set."""
-    left_tokens = set(normalize_for_match(left).split())
-    right_tokens = set(normalize_for_match(right).split())
-    if not left_tokens or not right_tokens:
-        return 0.0
-    return len(left_tokens & right_tokens) / min(len(left_tokens), len(right_tokens))
-
-
-def cosine_similarity(left: list[float] | None, right: list[float] | None) -> float:
-    """Compute cosine similarity between two vectors."""
-    if not left or not right:
-        return 0.0
-    numerator = sum(left_value * right_value for left_value, right_value in zip(left, right))
-    left_norm = math.sqrt(sum(value * value for value in left))
-    right_norm = math.sqrt(sum(value * value for value in right))
-    if left_norm == 0.0 or right_norm == 0.0:
-        return 0.0
-    return numerator / (left_norm * right_norm)
+    return re.sub(r"\s+", " ", value).strip()
 
 
 def coerce_bool(value: object, default: bool = False) -> bool:
@@ -142,9 +97,15 @@ def truncate_text(value: str, limit: int = 120) -> str:
 
 
 class CommentNormalizer:
-    """LLM-based comment normalizer with a local fallback."""
+    """LLM-based comment normalizer with a small local fallback."""
 
-    def __init__(self, llm: BaseChatModel):
+    def __init__(
+        self,
+        llm: BaseChatModel,
+        *,
+        min_meaningful_length: int = 3,
+        llm_semaphore: asyncio.Semaphore | None = None,
+    ):
         parser = JsonOutputParser()
         self._chain = (
             ChatPromptTemplate.from_messages(
@@ -156,11 +117,16 @@ class CommentNormalizer:
             | llm
             | parser
         )
+        self._min_meaningful_length = min_meaningful_length
+        self._llm_semaphore = llm_semaphore
 
     def normalize(self, text: str) -> NormalizationResult:
+        return asyncio.run(self.anormalize(text))
+
+    async def anormalize(self, text: str) -> NormalizationResult:
         """Normalize a comment and decide if it is meaningful."""
         try:
-            raw = self._chain.invoke({"text": text})
+            raw = await self._ainvoke_chain({"text": text})
             normalized_text = technical_normalize_text(raw.get("normalized_text", text))
             if not normalized_text:
                 normalized_text = technical_normalize_text(text)
@@ -172,7 +138,7 @@ class CommentNormalizer:
                 reason = (
                     "Комментарий содержит осмысленный кейс"
                     if is_meaningful
-                    else "Комментарий пустой, мусорный или бессодержательный"
+                    else "Комментарий пустой, шумный или бессодержательный"
                 )
             return NormalizationResult(
                 normalized_text=normalized_text,
@@ -183,13 +149,19 @@ class CommentNormalizer:
             logger.error("Normalization failed, using fallback: %s", exc)
             return self._fallback(text)
 
+    async def _ainvoke_chain(self, payload: dict) -> dict:
+        if self._llm_semaphore is None:
+            return await self._chain.ainvoke(payload)
+        async with self._llm_semaphore:
+            return await self._chain.ainvoke(payload)
+
     def _fallback(self, text: str) -> NormalizationResult:
         normalized_text = technical_normalize_text(text)
         is_meaningful = not self._is_clearly_noise(normalized_text)
         reason = (
             "Комментарий содержит осмысленный кейс"
             if is_meaningful
-            else "Комментарий пустой, мусорный или бессодержательный"
+            else "Комментарий пустой, шумный или бессодержательный"
         )
         return NormalizationResult(
             normalized_text=normalized_text,
@@ -197,27 +169,15 @@ class CommentNormalizer:
             reason=reason,
         )
 
-    @staticmethod
-    def _is_clearly_noise(text: str) -> bool:
+    def _is_clearly_noise(self, text: str) -> bool:
         normalized = normalize_for_match(text)
-        if not normalized:
-            return True
-        tokens = normalized.split()
-        if not tokens:
-            return True
-        if len("".join(tokens)) < 3:
-            return True
-        if len(tokens) <= 2 and all(token in _NON_INFORMATIVE_TOKENS for token in tokens):
-            return True
-        if re.fullmatch(r"[\W_]+", text or ""):
-            return True
-        return False
+        return len(normalized.replace(" ", "")) < self._min_meaningful_length
 
 
 class GroupDecisionEngine:
     """LLM steps for primary routing and verification."""
 
-    def __init__(self, llm: BaseChatModel):
+    def __init__(self, llm: BaseChatModel, *, llm_semaphore: asyncio.Semaphore | None = None):
         parser = JsonOutputParser()
         self._primary_chain = (
             ChatPromptTemplate.from_messages(
@@ -239,8 +199,28 @@ class GroupDecisionEngine:
             | llm
             | parser
         )
+        self._llm_semaphore = llm_semaphore
 
     def choose_group(
+        self,
+        *,
+        raw_text: str,
+        normalized_text: str,
+        candidate_groups_text: str,
+        candidate_group_ids: set[str],
+        fallback: PrimaryDecision,
+    ) -> PrimaryDecision:
+        return asyncio.run(
+            self.achoose_group(
+                raw_text=raw_text,
+                normalized_text=normalized_text,
+                candidate_groups_text=candidate_groups_text,
+                candidate_group_ids=candidate_group_ids,
+                fallback=fallback,
+            )
+        )
+
+    async def achoose_group(
         self,
         *,
         raw_text: str,
@@ -256,9 +236,9 @@ class GroupDecisionEngine:
                 group_id="",
                 reason="Среди уже обработанных комментариев нет кандидатов для сравнения",
             )
-
         try:
-            raw = self._primary_chain.invoke(
+            raw = await self._ainvoke_chain(
+                self._primary_chain,
                 {
                     "raw_text": raw_text,
                     "normalized_text": normalized_text,
@@ -293,9 +273,29 @@ class GroupDecisionEngine:
         group_examples_text: str,
         fallback: VerificationDecision,
     ) -> VerificationDecision:
+        return asyncio.run(
+            self.averify_group(
+                raw_text=raw_text,
+                normalized_text=normalized_text,
+                group_id=group_id,
+                group_examples_text=group_examples_text,
+                fallback=fallback,
+            )
+        )
+
+    async def averify_group(
+        self,
+        *,
+        raw_text: str,
+        normalized_text: str,
+        group_id: str,
+        group_examples_text: str,
+        fallback: VerificationDecision,
+    ) -> VerificationDecision:
         """Ask the LLM to verify the chosen existing group."""
         try:
-            raw = self._verification_chain.invoke(
+            raw = await self._ainvoke_chain(
+                self._verification_chain,
                 {
                     "raw_text": raw_text,
                     "normalized_text": normalized_text,
@@ -310,11 +310,17 @@ class GroupDecisionEngine:
             logger.error("Verification failed, using fallback: %s", exc)
             return fallback
 
+    async def _ainvoke_chain(self, chain, payload: dict) -> dict:
+        if self._llm_semaphore is None:
+            return await chain.ainvoke(payload)
+        async with self._llm_semaphore:
+            return await chain.ainvoke(payload)
+
 
 class GroupNameGenerator:
     """LLM-based group naming with a lightweight fallback."""
 
-    def __init__(self, llm: BaseChatModel):
+    def __init__(self, llm: BaseChatModel, *, llm_semaphore: asyncio.Semaphore | None = None):
         parser = JsonOutputParser()
         self._chain = (
             ChatPromptTemplate.from_messages(
@@ -326,11 +332,19 @@ class GroupNameGenerator:
             | llm
             | parser
         )
+        self._llm_semaphore = llm_semaphore
 
     def generate_name(self, examples_text: str, fallback_name: str) -> str:
+        return asyncio.run(self.agenerate_name(examples_text, fallback_name))
+
+    async def agenerate_name(self, examples_text: str, fallback_name: str) -> str:
         """Generate a short group name."""
         try:
-            raw = self._chain.invoke({"group_examples": examples_text})
+            if self._llm_semaphore is None:
+                raw = await self._chain.ainvoke({"group_examples": examples_text})
+            else:
+                async with self._llm_semaphore:
+                    raw = await self._chain.ainvoke({"group_examples": examples_text})
             group_name = technical_normalize_text(raw.get("group_name", ""))
             if group_name:
                 return group_name
@@ -390,14 +404,16 @@ class CommentMemoryStore:
         """Return all groups in creation order."""
         return sorted(self._groups_by_id.values(), key=lambda group: group.group_id)
 
+    def indexed_comments_count(self) -> int:
+        """Return the number of comments currently stored in the vector index."""
+        if self._vectorstore is None:
+            return 0
+        return len(self._vectorstore.index_to_docstore_id)
+
     def merge_groups_by_name(self) -> None:
         """Merge groups that ended up with the same normalized final name."""
-        groups = self.all_groups()
-        if len(groups) < 2:
-            return
-
         canonical_group_by_name: dict[str, CommentGroup] = {}
-        for group in groups:
+        for group in self.all_groups():
             normalized_name = normalize_for_match(group.group_name)
             if not normalized_name:
                 continue
@@ -414,10 +430,7 @@ class CommentMemoryStore:
                 if stored_comment:
                     stored_comment.group_id = canonical_group.group_id
 
-            if (
-                len(group.member_comment_ids) > len(canonical_group.member_comment_ids)
-                and group.group_name
-            ):
+            if len(group.member_comment_ids) > len(canonical_group.member_comment_ids) and group.group_name:
                 canonical_group.group_name = group.group_name
 
             self._groups_by_id.pop(group.group_id, None)
@@ -448,8 +461,14 @@ class CommentMemoryStore:
             for group in self.all_groups()
         ]
 
-    def search_similar(self, embedding: list[float], top_k: int) -> list[SimilarityHit]:
-        """Search similar already-processed comments."""
+    def search_similar(
+        self,
+        embedding: list[float],
+        top_k: int,
+        *,
+        filter_metadata: dict[str, str] | None = None,
+    ) -> list[SimilarityHit]:
+        """Search similar already-processed comments using FAISS scores directly."""
         if not self._vectorstore or not embedding:
             return []
 
@@ -457,6 +476,8 @@ class CommentMemoryStore:
             hits = self._vectorstore.similarity_search_with_score_by_vector(
                 embedding,
                 k=top_k,
+                filter=filter_metadata,
+                fetch_k=max(top_k * 3, top_k),
             )
         except Exception as exc:
             logger.error("Vector search failed: %s", exc)
@@ -464,7 +485,7 @@ class CommentMemoryStore:
 
         similarities: list[SimilarityHit] = []
         seen_comment_ids: set[str] = set()
-        for document, _score in hits:
+        for document, score in hits:
             comment_id = str(document.metadata.get("comment_id", "")).strip()
             if not comment_id or comment_id in seen_comment_ids:
                 continue
@@ -476,7 +497,7 @@ class CommentMemoryStore:
                 SimilarityHit(
                     comment_id=comment_id,
                     group_id=stored.group_id,
-                    similarity=cosine_similarity(embedding, stored.embedding),
+                    similarity=float(score),
                 )
             )
         similarities.sort(key=lambda item: item.similarity, reverse=True)
@@ -487,48 +508,42 @@ class CommentMemoryStore:
         group_id: str,
         *,
         limit: int,
-        query_embedding: list[float] | None = None,
+        preferred_comment_ids: list[str] | None = None,
     ) -> list[StoredComment]:
-        """Choose representative comments with a balance of relevance and diversity."""
-        comments = self._unique_group_comments(group_id)
-        if len(comments) <= limit:
-            return comments
+        """Choose representative comments, prioritizing retrieved hits when available."""
+        unique_comments = self._unique_group_comments(group_id)
+        if len(unique_comments) <= limit and not preferred_comment_ids:
+            return unique_comments
 
-        if query_embedding:
-            comments.sort(
-                key=lambda comment: cosine_similarity(query_embedding, comment.embedding),
-                reverse=True,
-            )
-
-        pool_size = min(len(comments), max(limit * 3, limit))
-        pool = comments[:pool_size]
+        comments_by_id = {comment.comment_id: comment for comment in unique_comments}
         selected: list[StoredComment] = []
-        remaining = pool[:]
+        seen_comment_ids: set[str] = set()
+        seen_normalized: set[str] = set()
 
-        if remaining:
-            if query_embedding:
-                first = max(
-                    remaining,
-                    key=lambda comment: cosine_similarity(query_embedding, comment.embedding),
-                )
-            else:
-                first = remaining[0]
-            selected.append(first)
-            remaining.remove(first)
+        def add_comment(comment: StoredComment | None) -> None:
+            if comment is None or len(selected) >= limit:
+                return
+            normalized_key = normalize_for_match(comment.normalized_text)
+            if not normalized_key or comment.comment_id in seen_comment_ids or normalized_key in seen_normalized:
+                return
+            selected.append(comment)
+            seen_comment_ids.add(comment.comment_id)
+            seen_normalized.add(normalized_key)
 
-        while remaining and len(selected) < limit:
-            next_comment = max(
-                remaining,
-                key=lambda comment: self._representative_score(
-                    comment=comment,
-                    selected=selected,
-                    query_embedding=query_embedding,
-                ),
-            )
-            selected.append(next_comment)
-            remaining.remove(next_comment)
+        for comment_id in preferred_comment_ids or []:
+            add_comment(comments_by_id.get(comment_id))
+
+        for comment in reversed(self.get_group_comments(group_id)):
+            add_comment(comment)
+
+        for comment in unique_comments:
+            add_comment(comment)
 
         return selected
+
+    def unique_group_comments(self, group_id: str) -> list[StoredComment]:
+        """Return all unique comments inside a group."""
+        return self._unique_group_comments(group_id)
 
     def _unique_group_comments(self, group_id: str) -> list[StoredComment]:
         """Drop exact normalized duplicates inside one group."""
@@ -536,33 +551,15 @@ class CommentMemoryStore:
         seen_normalized: set[str] = set()
         for comment in self.get_group_comments(group_id):
             normalized_key = normalize_for_match(comment.normalized_text)
-            if normalized_key in seen_normalized:
+            if not normalized_key or normalized_key in seen_normalized:
                 continue
             seen_normalized.add(normalized_key)
             unique.append(comment)
         return unique
 
-    @staticmethod
-    def _representative_score(
-        *,
-        comment: StoredComment,
-        selected: list[StoredComment],
-        query_embedding: list[float] | None,
-    ) -> tuple[float, float, float]:
-        query_similarity = cosine_similarity(query_embedding, comment.embedding) if query_embedding else 0.0
-        if selected and comment.embedding:
-            max_similarity_to_selected = max(
-                cosine_similarity(comment.embedding, selected_comment.embedding)
-                for selected_comment in selected
-            )
-        else:
-            max_similarity_to_selected = 0.0
-        novelty = 1.0 - max_similarity_to_selected
-        return novelty, query_similarity, -len(comment.normalized_text)
-
     def _index_comment(self, comment: StoredComment) -> None:
         text_embeddings = [(comment.normalized_text, comment.embedding or [])]
-        metadatas = [{"comment_id": comment.comment_id}]
+        metadatas = [{"comment_id": comment.comment_id, "group_id": comment.group_id}]
         ids = [comment.comment_id]
         if self._vectorstore is None:
             self._vectorstore = FAISS.from_embeddings(
@@ -570,13 +567,16 @@ class CommentMemoryStore:
                 self._embeddings,
                 metadatas=metadatas,
                 ids=ids,
+                normalize_L2=True,
+                distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
             )
-        else:
-            self._vectorstore.add_embeddings(
-                text_embeddings,
-                metadatas=metadatas,
-                ids=ids,
-            )
+            return
+
+        self._vectorstore.add_embeddings(
+            text_embeddings,
+            metadatas=metadatas,
+            ids=ids,
+        )
 
 
 class IncrementalMVPClusteringPipeline:
@@ -592,27 +592,51 @@ class IncrementalMVPClusteringPipeline:
         representatives_per_group: int = 3,
         verification_sample_size: int = 6,
         group_naming_sample_size: int = 12,
+        min_meaningful_length: int = 3,
+        primary_similarity_threshold: float = 0.92,
+        verification_similarity_threshold: float = 0.90,
+        max_concurrent_llm_requests: int = 10,
     ):
         self._embeddings = embeddings
-        self._normalizer = CommentNormalizer(llm)
-        self._decision_engine = GroupDecisionEngine(llm)
-        self._name_generator = GroupNameGenerator(llm)
+        self._llm_semaphore = asyncio.Semaphore(max_concurrent_llm_requests)
+        self._normalizer = CommentNormalizer(
+            llm,
+            min_meaningful_length=min_meaningful_length,
+            llm_semaphore=self._llm_semaphore,
+        )
+        self._decision_engine = GroupDecisionEngine(
+            llm,
+            llm_semaphore=self._llm_semaphore,
+        )
+        self._name_generator = GroupNameGenerator(
+            llm,
+            llm_semaphore=self._llm_semaphore,
+        )
         self._store = CommentMemoryStore(embeddings)
         self._retrieval_top_k = retrieval_top_k
         self._max_candidate_groups = max_candidate_groups
         self._representatives_per_group = representatives_per_group
         self._verification_sample_size = verification_sample_size
         self._group_naming_sample_size = group_naming_sample_size
+        self._primary_similarity_threshold = primary_similarity_threshold
+        self._verification_similarity_threshold = verification_similarity_threshold
+        self._max_concurrent_llm_requests = max_concurrent_llm_requests
 
     def run(self, raw_comments: list[dict]) -> dict[str, list[dict]]:
+        return asyncio.run(self.arun(raw_comments))
+
+    async def arun(self, raw_comments: list[dict]) -> dict[str, list[dict]]:
         """Process comments incrementally and return comments plus final groups."""
         comments = self._validate(raw_comments)
         logger.info("Incremental MVP pipeline started: %d comments", len(comments))
 
-        for comment in comments:
-            self._process_comment(comment)
+        prepared_comments = await asyncio.gather(
+            *(self._prepare_comment(comment) for comment in comments)
+        )
+        for comment, normalization, embedding in prepared_comments:
+            await self._process_comment(comment, normalization, embedding)
 
-        self._generate_group_names()
+        await self._generate_group_names()
         self._store.merge_groups_by_name()
 
         return {
@@ -629,9 +653,23 @@ class IncrementalMVPClusteringPipeline:
             comments.append(InputComment(comment_id=comment_id, text=text))
         return comments
 
-    def _process_comment(self, comment: InputComment) -> None:
+    async def _prepare_comment(
+        self,
+        comment: InputComment,
+    ) -> tuple[InputComment, NormalizationResult, list[float] | None]:
         logger.info("Processing comment %s", comment.comment_id)
-        normalization = self._normalizer.normalize(comment.text)
+        normalization = await self._normalizer.anormalize(comment.text)
+        embedding = None
+        if normalization.is_meaningful:
+            embedding = await self._build_embedding(normalization.normalized_text)
+        return comment, normalization, embedding
+
+    async def _process_comment(
+        self,
+        comment: InputComment,
+        normalization: NormalizationResult,
+        embedding: list[float] | None,
+    ) -> None:
 
         if not normalization.is_meaningful:
             self._store.add_comment(
@@ -648,17 +686,16 @@ class IncrementalMVPClusteringPipeline:
             )
             return
 
-        embedding = self._build_embedding(normalization.normalized_text)
         hits = self._store.search_similar(
             embedding=embedding or [],
-            top_k=self._retrieval_top_k,
+            top_k=self._store.indexed_comments_count(),
         )
-        candidate_groups = self._build_candidate_groups(hits, embedding)
+        candidate_groups = self._build_candidate_groups(hits)
         fallback_primary = self._fallback_primary_decision(
             normalized_text=normalization.normalized_text,
             candidate_groups=candidate_groups,
         )
-        primary_decision = self._decision_engine.choose_group(
+        primary_decision = await self._decision_engine.achoose_group(
             raw_text=comment.text,
             normalized_text=normalization.normalized_text,
             candidate_groups_text=self._format_candidate_groups(candidate_groups),
@@ -667,7 +704,7 @@ class IncrementalMVPClusteringPipeline:
         )
 
         if primary_decision.decision_type == DecisionType.EXISTING_GROUP and primary_decision.group_id:
-            verification = self._verify_existing_group(
+            verification = await self._verify_existing_group(
                 comment=comment,
                 normalized_text=normalization.normalized_text,
                 embedding=embedding,
@@ -720,44 +757,35 @@ class IncrementalMVPClusteringPipeline:
             )
         )
 
-    def _build_embedding(self, normalized_text: str) -> list[float] | None:
+    async def _build_embedding(self, normalized_text: str) -> list[float] | None:
         try:
-            return list(self._embeddings.embed_query(normalized_text))
+            return list(await self._embeddings.aembed_query(normalized_text))
         except Exception as exc:
             logger.error("Embedding generation failed: %s", exc)
             return None
 
-    def _build_candidate_groups(
-        self,
-        hits: list[SimilarityHit],
-        embedding: list[float] | None,
-    ) -> list[CandidateGroup]:
+    def _build_candidate_groups(self, hits: list[SimilarityHit]) -> list[CandidateGroup]:
         group_scores: dict[str, float] = {}
+        group_hit_ids: dict[str, list[str]] = {}
+
         for hit in hits:
-            current_best = group_scores.get(hit.group_id)
-            if current_best is None or hit.similarity > current_best:
-                group_scores[hit.group_id] = hit.similarity
+            group_scores[hit.group_id] = max(group_scores.get(hit.group_id, float("-inf")), hit.similarity)
+            group_hit_ids.setdefault(hit.group_id, []).append(hit.comment_id)
 
         ordered_group_ids = sorted(
             group_scores,
             key=lambda group_id: group_scores[group_id],
             reverse=True,
-        )[: self._max_candidate_groups]
+        )
 
         candidates: list[CandidateGroup] = []
         for group_id in ordered_group_ids:
-            representatives = self._store.select_group_representatives(
-                group_id,
-                limit=self._representatives_per_group,
-                query_embedding=embedding,
-            )
+            representatives = self._store.unique_group_comments(group_id)
             candidates.append(
                 CandidateGroup(
                     group_id=group_id,
                     best_similarity=group_scores[group_id],
-                    representative_comment_ids=[
-                        representative.comment_id for representative in representatives
-                    ],
+                    representative_comment_ids=[comment.comment_id for comment in representatives],
                 )
             )
         return candidates
@@ -782,28 +810,18 @@ class IncrementalMVPClusteringPipeline:
             for comment_id in best_candidate.representative_comment_ids
         ]
 
-        for representative in representative_comments:
-            if normalize_for_match(representative.normalized_text) == normalized_key:
-                return PrimaryDecision(
-                    decision_type=DecisionType.EXISTING_GROUP,
-                    group_id=best_candidate.group_id,
-                    reason="Есть точное совпадение с уже обработанным комментарием этой группы",
-                )
-
-        best_overlap = max(
-            (
-                token_overlap(normalized_text, representative.normalized_text)
-                for representative in representative_comments
-            ),
-            default=0.0,
-        )
-        if best_candidate.best_similarity >= 0.94 or (
-            best_candidate.best_similarity >= 0.90 and best_overlap >= 0.75
-        ):
+        if any(normalize_for_match(comment.normalized_text) == normalized_key for comment in representative_comments):
             return PrimaryDecision(
                 decision_type=DecisionType.EXISTING_GROUP,
                 group_id=best_candidate.group_id,
-                reason="Лучший кандидат достаточно близок по embedding и текстовому совпадению",
+                reason="Есть точное совпадение с уже обработанным комментарием этой группы",
+            )
+
+        if best_candidate.best_similarity >= self._primary_similarity_threshold:
+            return PrimaryDecision(
+                decision_type=DecisionType.EXISTING_GROUP,
+                group_id=best_candidate.group_id,
+                reason="Лучший кандидат достаточно близок по retrieval similarity",
             )
 
         return PrimaryDecision(
@@ -812,7 +830,7 @@ class IncrementalMVPClusteringPipeline:
             reason="Похожие комментарии есть, но уверенного совпадения с существующей группой нет",
         )
 
-    def _verify_existing_group(
+    async def _verify_existing_group(
         self,
         *,
         comment: InputComment,
@@ -827,20 +845,18 @@ class IncrementalMVPClusteringPipeline:
                 reason="Выбранная группа не содержит сохраненных комментариев для проверки",
             )
 
-        sample_size = len(group_comments)
-        if len(group_comments) >= 5:
-            sample_size = max(5, min(self._verification_sample_size, len(group_comments)))
-        representatives = self._store.select_group_representatives(
-            decision.group_id,
-            limit=sample_size,
-            query_embedding=embedding,
+        group_hits = self._store.search_similar(
+            embedding=embedding or [],
+            top_k=self._store.indexed_comments_count(),
+            filter_metadata={"group_id": decision.group_id},
         )
+        representatives = self._store.unique_group_comments(decision.group_id)
         fallback = self._fallback_verification(
             normalized_text=normalized_text,
-            embedding=embedding,
             representatives=representatives,
+            group_hits=group_hits,
         )
-        return self._decision_engine.verify_group(
+        return await self._decision_engine.averify_group(
             raw_text=comment.text,
             normalized_text=normalized_text,
             group_id=decision.group_id,
@@ -848,38 +864,22 @@ class IncrementalMVPClusteringPipeline:
             fallback=fallback,
         )
 
-    @staticmethod
     def _fallback_verification(
+        self,
         *,
         normalized_text: str,
-        embedding: list[float] | None,
         representatives: list[StoredComment],
+        group_hits: list[SimilarityHit],
     ) -> VerificationDecision:
         normalized_key = normalize_for_match(normalized_text)
-        if any(
-            normalize_for_match(representative.normalized_text) == normalized_key
-            for representative in representatives
-        ):
+        if any(normalize_for_match(comment.normalized_text) == normalized_key for comment in representatives):
             return VerificationDecision(
                 passed=True,
                 reason="В группе есть комментарий с тем же нормализованным смыслом",
             )
 
-        similarities = [
-            cosine_similarity(embedding, representative.embedding)
-            for representative in representatives
-        ]
-        max_similarity = max(similarities, default=0.0)
-        mean_similarity = sum(similarities) / len(similarities) if similarities else 0.0
-        overlap = max(
-            (
-                token_overlap(normalized_text, representative.normalized_text)
-                for representative in representatives
-            ),
-            default=0.0,
-        )
-
-        passed = max_similarity >= 0.94 or (mean_similarity >= 0.88 and overlap >= 0.70)
+        best_similarity = max((hit.similarity for hit in group_hits), default=0.0)
+        passed = best_similarity >= self._verification_similarity_threshold
         reason = (
             "Комментарий соответствует проверяемой группе"
             if passed
@@ -887,19 +887,17 @@ class IncrementalMVPClusteringPipeline:
         )
         return VerificationDecision(passed=passed, reason=reason)
 
-    def _generate_group_names(self) -> None:
-        for group in self._store.all_groups():
-            representatives = self._store.select_group_representatives(
-                group.group_id,
-                limit=min(self._group_naming_sample_size, max(1, len(group.member_comment_ids))),
-                query_embedding=None,
-            )
+    async def _generate_group_names(self) -> None:
+        async def assign_group_name(group: CommentGroup) -> None:
+            representatives = self._store.unique_group_comments(group.group_id)
             examples_text = self._format_group_examples(representatives)
             fallback_name = self._fallback_group_name(representatives)
-            group.group_name = self._name_generator.generate_name(
+            group.group_name = await self._name_generator.agenerate_name(
                 examples_text=examples_text,
                 fallback_name=fallback_name,
             )
+
+        await asyncio.gather(*(assign_group_name(group) for group in self._store.all_groups()))
 
     @staticmethod
     def _fallback_group_name(representatives: list[StoredComment]) -> str:

@@ -2,13 +2,12 @@
 
 from __future__ import annotations
 
+import asyncio
 import argparse
 import json
 import logging
 import sys
 from pathlib import Path
-
-import pandas as pd
 
 if __package__:
     from ..model import embeddings, model as llm
@@ -73,13 +72,36 @@ def build_console_output(result: dict) -> dict:
         {key: value for key, value in comment.items() if key != "embedding"}
         for comment in result.get("comments", [])
     ]
+    comments_by_group_id: dict[str, list[dict]] = {}
+    for comment in comments:
+        group_id = str(comment.get("group_id", "")).strip()
+        if not group_id:
+            continue
+        comments_by_group_id.setdefault(group_id, []).append(
+            {
+                "comment_id": comment["comment_id"],
+                "raw_text": comment["raw_text"],
+                "normalized_text": comment["normalized_text"],
+            }
+        )
+
+    groups = []
+    for group in result.get("groups", []):
+        group_id = group.get("group_id", "")
+        groups.append(
+            {
+                **group,
+                "member_comments": comments_by_group_id.get(group_id, []),
+            }
+        )
+
     return {
         "comments": comments,
-        "groups": result.get("groups", []),
+        "groups": groups,
     }
 
 
-def main() -> None:
+async def amain() -> None:
     """Run the incremental MVP clustering demo."""
     configure_logging()
     args = parse_args()
@@ -88,14 +110,12 @@ def main() -> None:
         llm=llm,
         embeddings=embeddings,
     )
-    df = pd.read_excel(r"C:\Users\Slav4ik\PycharmProjects\ClusteringTextData\data\comments_1000.xlsx")
-    df = df.iloc[:10]
-    # print(df)
-    df_comments = [
-        {"comment_id": str(row["comment_id"]), "text": row["comment"]} for idx, row in df.iterrows()
-    ]
-    result = pipeline.run(df_comments)
+    result = await pipeline.arun(comments)
     print(json.dumps(build_console_output(result), ensure_ascii=False, indent=2))
+
+
+def main() -> None:
+    asyncio.run(amain())
 
 
 if __name__ == "__main__":
