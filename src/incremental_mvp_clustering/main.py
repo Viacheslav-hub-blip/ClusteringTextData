@@ -1,9 +1,9 @@
-"""CLI entrypoint for the incremental MVP clustering pipeline."""
+"""Entrypoint for running the incremental MVP clustering pipeline on the full demo dataset."""
 
 from __future__ import annotations
 
 import asyncio
-import argparse
+import csv
 import json
 import logging
 import sys
@@ -11,6 +11,7 @@ from pathlib import Path
 
 if __package__:
     from ..model import embeddings, model as llm
+    from .agentic_post_processing import AgenticPostProcessingPipeline
     from .pipeline import IncrementalMVPClusteringPipeline
 else:
     CURRENT_FILE = Path(__file__).resolve()
@@ -20,17 +21,11 @@ else:
         if path not in sys.path:
             sys.path.insert(0, path)
 
+    from src.incremental_mvp_clustering.agentic_post_processing import AgenticPostProcessingPipeline
     from src.incremental_mvp_clustering.pipeline import IncrementalMVPClusteringPipeline
     from src.model import embeddings, model as llm
 
-DEMO_COMMENTS = [
-    {"comment_id": "1", "text": "Не могу перевести деньги"},
-    {"comment_id": "2", "text": "Перевод денег не проходит"},
-    {"comment_id": "3", "text": "Не проходит перевод между своими счетами"},
-    {"comment_id": "4", "text": "Не могу войти в приложение"},
-    {"comment_id": "5", "text": "Приложение не открывается"},
-    {"comment_id": "6", "text": "..."},
-]
+DEMO_DATA_PATH = Path(__file__).resolve().parents[2] / "data" / "comments_1000_utf8.csv"
 
 
 def configure_logging() -> None:
@@ -41,29 +36,18 @@ def configure_logging() -> None:
     )
 
 
-def parse_args() -> argparse.Namespace:
-    """Parse CLI arguments."""
-    parser = argparse.ArgumentParser(
-        description="Run the incremental MVP clustering pipeline",
-    )
-    parser.add_argument(
-        "--json",
-        type=Path,
-        help="Path to a JSON file with a list of {comment_id, text} objects",
-    )
-    return parser.parse_args()
-
-
-def load_comments(json_path: Path | None) -> list[dict]:
-    """Load comments from JSON or use demo data."""
-    if not json_path:
-        return DEMO_COMMENTS
-    with json_path.open("r", encoding="utf-8") as file:
-        payload = json.load(file)
-    if not isinstance(payload, list):
-        msg = "Expected a JSON array of comment objects"
-        raise ValueError(msg)
-    return payload
+def load_comments() -> list[dict]:
+    """Load all comments from the demo CSV file."""
+    comments: list[dict[str, str]] = []
+    with DEMO_DATA_PATH.open("r", encoding="utf-8-sig", newline="") as file:
+        reader = csv.DictReader(file, delimiter=";")
+        for row in reader:
+            comment_id = str(row.get("comment_id", "")).strip()
+            text = str(row.get("comment", "")).strip()
+            if not comment_id or not text:
+                continue
+            comments.append({"comment_id": comment_id, "text": text})
+    return comments
 
 
 def build_console_output(result: dict) -> dict:
@@ -95,23 +79,42 @@ def build_console_output(result: dict) -> dict:
             }
         )
 
-    return {
+    output = {
         "comments": comments,
         "groups": groups,
     }
+    if "post_processing" in result:
+        output["post_processing"] = result["post_processing"]
+    return output
 
 
 async def amain() -> None:
-    """Run the incremental MVP clustering demo."""
+    """Run the incremental MVP clustering pipeline on the demo CSV."""
     configure_logging()
-    args = parse_args()
-    comments = load_comments(args.json)
-    pipeline = IncrementalMVPClusteringPipeline(
+    comments = load_comments()
+    comments = comments[:20]
+    primary_pipeline = IncrementalMVPClusteringPipeline(
         llm=llm,
         embeddings=embeddings,
     )
-    result = await pipeline.arun(comments)
-    print(json.dumps(build_console_output(result), ensure_ascii=False, indent=2))
+    logging.info("Primary clustering started: %d comments", len(comments))
+    primary_result = await primary_pipeline.arun(comments)
+    logging.info(
+        "Primary clustering finished: %d comments, %d groups",
+        len(primary_result.get("comments", [])),
+        len(primary_result.get("groups", [])),
+    )
+    logging.info("Agentic post-processing started")
+    post_processing_pipeline = AgenticPostProcessingPipeline(
+        llm=llm,
+        audit_batch_size=2
+    )
+    refined_result = await post_processing_pipeline.arun(primary_result)
+    logging.info(
+        "Agentic post-processing finished: %d final groups",
+        len(refined_result.get("groups", [])),
+    )
+    print(json.dumps(build_console_output(refined_result), ensure_ascii=False, indent=2))
 
 
 def main() -> None:

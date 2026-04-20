@@ -42,7 +42,6 @@ class StoredComment:
     group_id: str
     decision_type: DecisionType
     decision_reason: str
-    verification_passed: bool
 
 
 @dataclass(slots=True)
@@ -78,12 +77,4 @@ class PrimaryDecision:
 
     decision_type: DecisionType
     group_id: str
-    reason: str
-
-
-@dataclass(slots=True)
-class VerificationDecision:
-    """Verification result for an existing-group assignment."""
-
-    passed: bool
     reason: str
