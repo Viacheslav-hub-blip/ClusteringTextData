@@ -7,7 +7,7 @@ model = ChatOpenAI(
     base_url="https://openrouter.ai/api/v1",
     #api_key="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",
     api_key="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",
-    model="z-ai/glm-5",
+    model="google/gemini-2.5-flash",
     #model="nvidia/nemotron-3-super-120b-a12b",
     #model="qwen/qwen3.5-397b-a17b",
     # google/gemini-3-pro-preview

@@ -92,7 +92,7 @@ async def amain() -> None:
     """Run the incremental MVP clustering pipeline on the demo CSV."""
     configure_logging()
     comments = load_comments()
-    comments = comments[:20]
+    comments = comments[:100]
     primary_pipeline = IncrementalMVPClusteringPipeline(
         llm=llm,
         embeddings=embeddings,

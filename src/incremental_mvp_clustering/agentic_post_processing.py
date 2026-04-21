@@ -1,4 +1,4 @@
-"""Agentic post-processing pipeline over primary clustering results."""
+"""Stateless agentic post-processing pipeline over primary clustering results."""
 
 from __future__ import annotations
 
@@ -19,6 +19,7 @@ from .agentic_models import (
     PlannerDecision,
     PostProcessingGroupName,
     SingletonResolutionDecision,
+    SupervisorStep,
     UnassignedRoutingDecision,
 )
 from .agentic_prompts import (
@@ -68,7 +69,7 @@ def _truncate_text(value: object, limit: int = 140) -> str:
 
 
 class AgenticPostProcessingPipeline:
-    """LangGraph reconciliation layer over the primary clustering output."""
+    """LangGraph reconciliation layer with deterministic supervisor and stateless workers."""
 
     def __init__(
         self,
@@ -78,13 +79,23 @@ class AgenticPostProcessingPipeline:
         planner_preview_group_limit: int = 20,
         audit_batch_size: int = 10,
         max_concurrent_llm_requests: int = 10,
+        candidate_cluster_limit: int = 40,
+        audit_comment_limit: int = 80,
+        max_rounds: int = 100,
+        max_no_change_rounds: int = 2,
+        max_audit_passes_per_group: int = 2,
     ):
-        self._max_examples_per_candidate_group = max_examples_per_candidate_group
-        self._planner_preview_group_limit = planner_preview_group_limit
+        self._max_examples_per_candidate_group = max(1, max_examples_per_candidate_group)
+        self._planner_preview_group_limit = max(1, planner_preview_group_limit)
         self._audit_batch_size = max(1, audit_batch_size)
+        self._candidate_cluster_limit = max(1, candidate_cluster_limit)
+        self._audit_comment_limit = max(1, audit_comment_limit)
+        self._max_rounds = max(1, max_rounds)
+        self._max_no_change_rounds = max(1, max_no_change_rounds)
+        self._max_audit_passes_per_group = max(1, max_audit_passes_per_group)
         self._llm_semaphore = asyncio.Semaphore(max_concurrent_llm_requests)
 
-        self._planner_chain = self._build_chain(POST_REVIEW_SYSTEM, POST_REVIEW_HUMAN, PlannerDecision, llm)
+        self._router_chain = self._build_chain(POST_REVIEW_SYSTEM, POST_REVIEW_HUMAN, PlannerDecision, llm)
         self._singleton_chain = self._build_chain(
             SINGLETON_RESOLUTION_SYSTEM,
             SINGLETON_RESOLUTION_HUMAN,
@@ -118,8 +129,9 @@ class AgenticPostProcessingPipeline:
         )
         final_state = await self._graph.ainvoke(state)
         logger.info(
-            "Agentic post-processing finished: %d final groups",
+            "Agentic post-processing finished: %d final groups, reason=%s",
             len(final_state.get("final_result", {}).get("groups", [])),
+            final_state.get("finish_reason", ""),
         )
         return final_state["final_result"]
 
@@ -136,26 +148,26 @@ class AgenticPostProcessingPipeline:
 
     def _build_graph(self) -> Any:
         graph = StateGraph(AgenticPostProcessingState)
-        graph.add_node("review", self._review_node)
+        graph.add_node("supervisor", self._supervisor_node)
+        graph.add_node("route_unassigned", self._route_unassigned_node)
         graph.add_node("resolve_singletons", self._resolve_singletons_node)
         graph.add_node("audit_group", self._audit_groups_batch_node)
-        graph.add_node("route_unassigned", self._route_unassigned_node)
         graph.add_node("finalize", self._finalize_node)
 
-        graph.add_edge(START, "review")
+        graph.add_edge(START, "supervisor")
         graph.add_conditional_edges(
-            "review",
-            self._route_from_review,
+            "supervisor",
+            self._route_from_supervisor,
             {
+                "route_unassigned": "route_unassigned",
                 "resolve_singletons": "resolve_singletons",
                 "audit_group": "audit_group",
-                "route_unassigned": "route_unassigned",
                 "finalize": "finalize",
             },
         )
-        graph.add_edge("resolve_singletons", "review")
-        graph.add_edge("audit_group", "review")
-        graph.add_edge("route_unassigned", "review")
+        graph.add_edge("route_unassigned", "supervisor")
+        graph.add_edge("resolve_singletons", "supervisor")
+        graph.add_edge("audit_group", "supervisor")
         graph.add_edge("finalize", END)
         return graph.compile()
 
@@ -172,22 +184,29 @@ class AgenticPostProcessingPipeline:
                     "normalized_text": _clean_text(comment.get("normalized_text", "")),
                     "group_id": str(comment.get("group_id", "")).strip(),
                     "initial_group_id": str(comment.get("group_id", "")).strip(),
-                    "postprocessing_trace": [],
+                    "postprocessing_trace": list(comment.get("postprocessing_trace", [])),
                 }
             )
             comments_by_id[comment_id] = comment
             comment_order.append(comment_id)
 
         groups_by_id = self._build_groups_by_id(primary_result.get("groups", []), comments_by_id, comment_order)
-        return {
+        state: AgenticPostProcessingState = {
             "comments_by_id": comments_by_id,
             "groups_by_id": groups_by_id,
             "comment_order": comment_order,
-            "pending_audit_group_ids": self._initial_pending_audit_groups(groups_by_id),
-            "planner_decision": {},
+            "accepted_singleton_group_ids": [],
+            "audit_queue": self._initial_audit_queue(groups_by_id),
+            "audit_attempts_by_group_id": {},
             "next_group_index": self._next_group_index(groups_by_id),
+            "next_step": "finalize",
+            "round_index": 0,
             "no_change_rounds": 0,
+            "last_patch_summary": {},
+            "finish_reason": "",
         }
+        state.update(self._build_queue_update(state))
+        return state
 
     @staticmethod
     def _build_groups_by_id(
@@ -218,191 +237,309 @@ class AgenticPostProcessingPipeline:
             if group["member_comment_ids"]
         }
 
-    async def _review_node(self, state: AgenticPostProcessingState) -> dict[str, Any]:
-        fallback = self._planner_fallback(state)
-        if fallback.next_step == "finish" and not self._needs_llm_review(state):
-            decision = fallback
-        else:
-            decision = await self._ainvoke_chain(
-                self._planner_chain,
-                {"state_summary": self._build_state_summary(state)},
-                fallback=fallback,
+    async def _supervisor_node(self, state: AgenticPostProcessingState) -> dict[str, Any]:
+        queue_update = self._build_queue_update(state)
+        unassigned_queue = queue_update["unassigned_queue"]
+        singleton_queue = queue_update["singleton_queue"]
+        audit_queue = queue_update["audit_queue"]
+        round_index = int(state.get("round_index", 0))
+        no_change_rounds = int(state.get("no_change_rounds", 0))
+        finish_reason = ""
+
+        if round_index >= self._max_rounds:
+            next_step: SupervisorStep = "finalize"
+            finish_reason = f"Safety stop: max_rounds={self._max_rounds} reached"
+        elif not unassigned_queue and no_change_rounds >= self._max_no_change_rounds:
+            next_step = "finalize"
+            finish_reason = f"No-change stop: no productive progress for {no_change_rounds} rounds"
+            queue_update["accepted_singleton_group_ids"] = self._merge_unique(
+                state.get("accepted_singleton_group_ids", []),
+                singleton_queue,
             )
+            queue_update["singleton_queue"] = []
+        elif not unassigned_queue and not singleton_queue and not audit_queue:
+            next_step = "finalize"
+            finish_reason = "Normal stop: all queues are empty or accepted"
+        else:
+            fallback_step = self._fallback_router_step(unassigned_queue, singleton_queue, audit_queue)
+            decision = await self._ainvoke_chain(
+                self._router_chain,
+                {"state_summary": self._build_router_summary(state, queue_update)},
+                fallback=PlannerDecision(next_step=self._to_planner_step(fallback_step), reason="Fallback router step"),
+            )
+            next_step = self._validate_router_step(
+                decision.next_step,
+                fallback_step=fallback_step,
+                unassigned_queue=unassigned_queue,
+                singleton_queue=singleton_queue,
+                audit_queue=audit_queue,
+            )
+            if next_step == "finalize":
+                finish_reason = f"LLM router selected finish: {decision.reason}"
 
-        planner_decision = decision.model_dump()
         logger.info(
-            "Agentic review selected step=%s, singletons=%d, unassigned=%d, audit_queue=%d",
-            planner_decision["next_step"],
-            len(self._singleton_group_ids(state)),
-            len(self._unassigned_comment_ids(state)),
-            len(self._pending_audit_group_ids(state)),
+            "LLM supervisor selected step=%s, round=%d, unassigned=%d, singleton=%d, audit=%d, no_change=%d",
+            next_step,
+            round_index,
+            len(unassigned_queue),
+            len(queue_update["singleton_queue"]),
+            len(audit_queue),
+            no_change_rounds,
         )
-        return {"planner_decision": planner_decision}
+        return {
+            **queue_update,
+            "next_step": next_step,
+            "finish_reason": finish_reason or state.get("finish_reason", ""),
+        }
 
-    def _route_from_review(self, state: AgenticPostProcessingState) -> str:
-        next_step = str(state.get("planner_decision", {}).get("next_step", "finish")).strip()
-        if self._unassigned_comment_ids(state) and next_step in {"route_unassigned", "finish"}:
+    @staticmethod
+    def _route_from_supervisor(state: AgenticPostProcessingState) -> SupervisorStep:
+        return state.get("next_step", "finalize")
+
+    def _build_router_summary(self, state: AgenticPostProcessingState, queues: dict[str, list[str]]) -> str:
+        """Compact router context without cluster texts or worker history."""
+        return "\n".join(
+            [
+                f"Total comments: {len(state['comments_by_id'])}",
+                f"Non-empty clusters: {len(state['groups_by_id'])}",
+                f"Unassigned comments: {len(queues['unassigned_queue'])}",
+                f"Singleton clusters pending decision: {len(queues['singleton_queue'])}",
+                f"Accepted singleton clusters: {len(queues['accepted_singleton_group_ids'])}",
+                f"Clusters pending audit: {len(queues['audit_queue'])}",
+                f"Round index: {state.get('round_index', 0)}",
+                f"No-change rounds: {state.get('no_change_rounds', 0)}",
+                f"Max rounds: {self._max_rounds}",
+                f"Max no-change rounds: {self._max_no_change_rounds}",
+                f"Audit batch size: {self._audit_batch_size}",
+                f"Last patch summary: {state.get('last_patch_summary', {})}",
+                "",
+                "Router constraints:",
+                "- If unassigned comments exist, choose route_unassigned unless there is a stronger reason to audit first.",
+                "- resolve_singletons is allowed when singleton_queue is non-empty.",
+                "- audit_group is allowed when audit_queue is non-empty.",
+                "- finish is allowed only when queues are empty/accepted or safety guards indicate stop.",
+                "- Do not request text-level context; workers receive local context later.",
+            ]
+        )
+
+    @staticmethod
+    def _fallback_router_step(
+        unassigned_queue: list[str],
+        singleton_queue: list[str],
+        audit_queue: list[str],
+    ) -> SupervisorStep:
+        if unassigned_queue:
             return "route_unassigned"
-        if next_step == "resolve_singletons" and self._singleton_group_ids(state):
+        if singleton_queue:
             return "resolve_singletons"
-        if next_step == "audit_group" and self._pending_audit_group_ids(state):
+        if audit_queue:
             return "audit_group"
-        if next_step == "route_unassigned" and self._unassigned_comment_ids(state):
-            return "route_unassigned"
         return "finalize"
+
+    @staticmethod
+    def _to_planner_step(step: SupervisorStep) -> str:
+        return "finish" if step == "finalize" else step
+
+    @staticmethod
+    def _validate_router_step(
+        requested_step: str,
+        *,
+        fallback_step: SupervisorStep,
+        unassigned_queue: list[str],
+        singleton_queue: list[str],
+        audit_queue: list[str],
+    ) -> SupervisorStep:
+        if requested_step == "finish":
+            return "finalize" if not (unassigned_queue or singleton_queue or audit_queue) else fallback_step
+        if requested_step == "route_unassigned":
+            return "route_unassigned" if unassigned_queue else fallback_step
+        if requested_step == "resolve_singletons":
+            return "resolve_singletons" if singleton_queue else fallback_step
+        if requested_step == "audit_group":
+            return "audit_group" if audit_queue else fallback_step
+        return fallback_step
 
     async def _resolve_singletons_node(self, state: AgenticPostProcessingState) -> dict[str, Any]:
         comments_by_id, groups_by_id = self._copy_cluster_state(state)
-        pending_audit_group_ids = list(state.get("pending_audit_group_ids", []))
-        change_count = 0
-        singleton_group_ids = self._singleton_group_ids({"groups_by_id": groups_by_id})
-        logger.info("Agentic step resolve_singletons started: %d singleton clusters", len(singleton_group_ids))
+        accepted_singleton_group_ids = list(state.get("accepted_singleton_group_ids", []))
+        audit_queue = list(state.get("audit_queue", []))
+        singleton_queue = list(state.get("singleton_queue", []))
+        logger.info("Agentic step resolve_singletons started: %d stateless workers", len(singleton_queue))
 
-        for group_id in singleton_group_ids:
+        tasks = [
+            self._decide_singleton(
+                comment=comments_by_id[group["member_comment_ids"][0]],
+                group=group,
+                candidate_groups=self._build_cluster_candidates(
+                    comments_by_id=comments_by_id,
+                    groups_by_id=groups_by_id,
+                    exclude_group_ids={group_id},
+                    limit=self._candidate_cluster_limit,
+                ),
+            )
+            for group_id in singleton_queue
+            if (group := groups_by_id.get(group_id))
+            and len(group.get("member_comment_ids", [])) == 1
+            and group["member_comment_ids"][0] in comments_by_id
+        ]
+        decisions = await asyncio.gather(*tasks) if tasks else []
+
+        applied_changes = 0
+        processed_items = 0
+        for group_id, decision in decisions:
             group = groups_by_id.get(group_id)
             if not group or len(group.get("member_comment_ids", [])) != 1:
                 continue
             comment_id = group["member_comment_ids"][0]
-            comment = comments_by_id.get(comment_id)
-            if not comment:
-                continue
-
-            decision = await self._decide_singleton(
-                comment=comment,
-                group=group,
-                candidate_groups=self._build_all_cluster_candidates(
-                    comments_by_id=comments_by_id,
-                    groups_by_id=groups_by_id,
-                    exclude_group_ids={group_id},
-                ),
-            )
             target_group_id = decision.target_group_id.strip()
-            if decision.action != "move_to_group" or target_group_id not in groups_by_id:
-                continue
+            processed_items += 1
 
-            if self._move_comment(comments_by_id, groups_by_id, comment_id, target_group_id, decision.reason):
-                change_count += 1
-                logger.info("Singleton comment %s moved: %s -> %s", comment_id, group_id, target_group_id)
-                pending_audit_group_ids = self._mark_group_for_audit(
-                    self._remove_group_from_audit_queue(pending_audit_group_ids, group_id),
-                    groups_by_id,
-                    target_group_id,
-                )
+            if decision.action == "move_to_group" and target_group_id in groups_by_id:
+                if self._move_comment(comments_by_id, groups_by_id, comment_id, target_group_id, decision.reason):
+                    applied_changes += 1
+                    audit_queue = self._mark_group_for_audit(audit_queue, state, groups_by_id, target_group_id)
+                    logger.info("Singleton comment %s moved: %s -> %s", comment_id, group_id, target_group_id)
+                    continue
+
+            accepted_singleton_group_ids = self._merge_unique(accepted_singleton_group_ids, [group_id])
+            logger.info("Singleton cluster %s accepted as separate cluster", group_id)
 
         return self._build_action_update(
             state,
-            change_count,
-            comments_by_id,
-            groups_by_id,
-            pending_audit_group_ids,
+            applied_changes=applied_changes,
+            processed_items=processed_items,
+            comments_by_id=comments_by_id,
+            groups_by_id=groups_by_id,
+            audit_queue=audit_queue,
+            accepted_singleton_group_ids=accepted_singleton_group_ids,
+            last_patch_summary={
+                "step": "resolve_singletons",
+                "workers": len(tasks),
+                "processed": processed_items,
+                "changes": applied_changes,
+            },
         )
 
     async def _audit_groups_batch_node(self, state: AgenticPostProcessingState) -> dict[str, Any]:
         comments_by_id, groups_by_id = self._copy_cluster_state(state)
-        pending_audit_group_ids = list(state.get("pending_audit_group_ids", []))
-        target_group_ids = self._pending_audit_group_ids(
-            {"groups_by_id": groups_by_id, "pending_audit_group_ids": pending_audit_group_ids}
-        )[: self._audit_batch_size]
+        audit_queue = list(state.get("audit_queue", []))
+        audit_attempts_by_group_id = dict(state.get("audit_attempts_by_group_id", {}))
+        target_group_ids = self._valid_audit_queue(state, groups_by_id)[: self._audit_batch_size]
         logger.info(
-            "Agentic step audit_group started: auditing %d/%d pending clusters",
+            "Agentic step audit_group started: %d/%d stateless workers",
             len(target_group_ids),
-            len(self._pending_audit_group_ids({"groups_by_id": groups_by_id, "pending_audit_group_ids": pending_audit_group_ids})),
+            len(self._valid_audit_queue(state, groups_by_id)),
         )
 
-        if not target_group_ids:
-            return self._build_action_update(state, 0, comments_by_id, groups_by_id, pending_audit_group_ids)
+        tasks = [self._audit_one_group(group_id, groups_by_id, comments_by_id) for group_id in target_group_ids]
+        audit_results = await asyncio.gather(*tasks) if tasks else []
 
-        audit_results = await asyncio.gather(
-            *(self._audit_one_group(group_id, groups_by_id, comments_by_id) for group_id in target_group_ids)
-        )
-
-        change_count = 0
-        for group_id, decision in audit_results:
+        applied_changes = 0
+        processed_items = 0
+        for group_id, decision, visible_comment_ids in audit_results:
+            processed_items += 1
+            audit_attempts_by_group_id[group_id] = audit_attempts_by_group_id.get(group_id, 0) + 1
             group = groups_by_id.get(group_id)
             if not group:
-                pending_audit_group_ids = self._remove_group_from_audit_queue(pending_audit_group_ids, group_id)
+                audit_queue = self._remove_group_from_queue(audit_queue, group_id)
                 continue
 
             removable_ids = [
                 comment_id
                 for comment_id in decision.remove_comment_ids
-                if comment_id in group.get("member_comment_ids", [])
+                if comment_id in visible_comment_ids and comment_id in group.get("member_comment_ids", [])
             ]
             for comment_id in removable_ids:
                 self._unassign_comment(comments_by_id, groups_by_id, comment_id, decision.reason)
-                change_count += 1
+                applied_changes += 1
             if removable_ids:
                 logger.info("Audit cluster %s removed %d comments", group_id, len(removable_ids))
 
+            audit_queue = self._remove_group_from_queue(audit_queue, group_id)
             if removable_ids and group_id in groups_by_id and len(groups_by_id[group_id]["member_comment_ids"]) > 1:
-                pending_audit_group_ids = self._mark_group_for_audit(pending_audit_group_ids, groups_by_id, group_id)
-            else:
-                pending_audit_group_ids = self._remove_group_from_audit_queue(pending_audit_group_ids, group_id)
+                audit_queue = self._mark_group_for_audit(audit_queue, state, groups_by_id, group_id, audit_attempts_by_group_id)
 
         return self._build_action_update(
             state,
-            change_count,
-            comments_by_id,
-            groups_by_id,
-            pending_audit_group_ids,
+            applied_changes=applied_changes,
+            processed_items=processed_items,
+            comments_by_id=comments_by_id,
+            groups_by_id=groups_by_id,
+            audit_queue=audit_queue,
+            audit_attempts_by_group_id=audit_attempts_by_group_id,
+            last_patch_summary={
+                "step": "audit_group",
+                "workers": len(tasks),
+                "processed": processed_items,
+                "changes": applied_changes,
+            },
         )
-
-    async def _audit_one_group(
-        self,
-        group_id: str,
-        groups_by_id: dict[str, dict[str, Any]],
-        comments_by_id: dict[str, dict[str, Any]],
-    ) -> tuple[str, ClusterAuditDecision]:
-        decision = await self._ainvoke_chain(
-            self._audit_chain,
-            {"group_card": self._format_group_card(groups_by_id[group_id], comments_by_id, include_all_members=True)},
-            fallback=ClusterAuditDecision(remove_comment_ids=[], reason="Cluster looks consistent"),
-        )
-        return group_id, decision
 
     async def _route_unassigned_node(self, state: AgenticPostProcessingState) -> dict[str, Any]:
         comments_by_id, groups_by_id = self._copy_cluster_state(state)
-        pending_audit_group_ids = list(state.get("pending_audit_group_ids", []))
+        audit_queue = list(state.get("audit_queue", []))
         next_group_index = int(state.get("next_group_index", 1))
-        change_count = 0
-        unassigned_comment_ids = self._unassigned_comment_ids({"comments_by_id": comments_by_id})
-        logger.info("Agentic step route_unassigned started: %d comments", len(unassigned_comment_ids))
+        unassigned_queue = list(state.get("unassigned_queue", []))
+        logger.info("Agentic step route_unassigned started: %d stateless workers", len(unassigned_queue))
 
-        for comment_id in unassigned_comment_ids:
-            comment = comments_by_id[comment_id]
-            decision = await self._decide_unassigned(
-                comment=comment,
-                candidate_groups=self._build_all_cluster_candidates(
+        tasks = [
+            self._decide_unassigned(
+                comment=comments_by_id[comment_id],
+                candidate_groups=self._build_cluster_candidates(
                     comments_by_id=comments_by_id,
                     groups_by_id=groups_by_id,
                     exclude_group_ids=set(),
+                    limit=self._candidate_cluster_limit,
                 ),
             )
+            for comment_id in unassigned_queue
+            if comment_id in comments_by_id
+        ]
+        decisions = await asyncio.gather(*tasks) if tasks else []
+
+        applied_changes = 0
+        processed_items = 0
+        for comment_id, decision in decisions:
+            if comment_id not in comments_by_id or comments_by_id[comment_id].get("group_id"):
+                continue
+            processed_items += 1
             target_group_id = decision.target_group_id.strip()
             if decision.action != "move_to_group" or target_group_id not in groups_by_id:
                 target_group_id, next_group_index = self._create_group(groups_by_id, next_group_index)
 
             self._assign_comment_to_group(comments_by_id, groups_by_id, comment_id, target_group_id, decision.reason)
+            audit_queue = self._mark_group_for_audit(audit_queue, state, groups_by_id, target_group_id)
+            applied_changes += 1
             logger.info("Unassigned comment %s routed to %s", comment_id, target_group_id)
-            pending_audit_group_ids = self._mark_group_for_audit(pending_audit_group_ids, groups_by_id, target_group_id)
-            change_count += 1
 
         return self._build_action_update(
             state,
-            change_count,
-            comments_by_id,
-            groups_by_id,
-            pending_audit_group_ids,
+            applied_changes=applied_changes,
+            processed_items=processed_items,
+            comments_by_id=comments_by_id,
+            groups_by_id=groups_by_id,
+            audit_queue=audit_queue,
             next_group_index=next_group_index,
+            last_patch_summary={
+                "step": "route_unassigned",
+                "workers": len(tasks),
+                "processed": processed_items,
+                "changes": applied_changes,
+            },
         )
 
     async def _finalize_node(self, state: AgenticPostProcessingState) -> dict[str, Any]:
         comments_by_id, groups_by_id = self._copy_cluster_state(state)
-        logger.info("Agentic step finalize started: naming %d groups", len(groups_by_id))
+        logger.info(
+            "Agentic step finalize started: naming %d groups, reason=%s",
+            len(groups_by_id),
+            state.get("finish_reason", ""),
+        )
         await self._rename_groups(groups_by_id, comments_by_id)
         self._merge_groups_by_name(groups_by_id, comments_by_id)
-        logger.info("Agentic step finalize finished: %d groups after merge", len(groups_by_id))
-        return {"final_result": self._build_final_result(state, comments_by_id, groups_by_id)}
+        final_result = self._build_final_result(state, comments_by_id, groups_by_id)
+        logger.info("Agentic step finalize finished: %d groups after merge", len(final_result["groups"]))
+        return {"final_result": final_result}
 
     async def _decide_singleton(
         self,
@@ -410,43 +547,61 @@ class AgenticPostProcessingPipeline:
         comment: dict[str, Any],
         group: dict[str, Any],
         candidate_groups: list[dict[str, Any]],
-    ) -> SingletonResolutionDecision:
+    ) -> tuple[str, SingletonResolutionDecision]:
+        group_id = str(group["group_id"])
         if not candidate_groups:
-            return SingletonResolutionDecision(
+            return group_id, SingletonResolutionDecision(
                 action="keep_current_group",
                 target_group_id="",
                 reason="No existing candidate clusters",
             )
-        return await self._ainvoke_chain(
+        decision = await self._ainvoke_chain(
             self._singleton_chain,
             {
                 "singleton_cluster": self._format_group_card(
                     group,
                     {comment["comment_id"]: comment},
-                    include_all_members=True,
+                    member_limit=1,
                 ),
                 "candidate_groups": self._format_candidate_groups(candidate_groups),
             },
             fallback=SingletonResolutionDecision(
                 action="keep_current_group",
                 target_group_id="",
-                reason="No confident existing cluster match",
+                reason="Fallback: singleton kept separate",
             ),
         )
+        return group_id, decision
+
+    async def _audit_one_group(
+        self,
+        group_id: str,
+        groups_by_id: dict[str, dict[str, Any]],
+        comments_by_id: dict[str, dict[str, Any]],
+    ) -> tuple[str, ClusterAuditDecision, set[str]]:
+        group = groups_by_id[group_id]
+        visible_comment_ids = set(group.get("member_comment_ids", [])[: self._audit_comment_limit])
+        decision = await self._ainvoke_chain(
+            self._audit_chain,
+            {"group_card": self._format_group_card(group, comments_by_id, member_limit=self._audit_comment_limit)},
+            fallback=ClusterAuditDecision(remove_comment_ids=[], reason="Fallback: cluster looks consistent"),
+        )
+        return group_id, decision, visible_comment_ids
 
     async def _decide_unassigned(
         self,
         *,
         comment: dict[str, Any],
         candidate_groups: list[dict[str, Any]],
-    ) -> UnassignedRoutingDecision:
+    ) -> tuple[str, UnassignedRoutingDecision]:
+        comment_id = str(comment["comment_id"])
         if not candidate_groups:
-            return UnassignedRoutingDecision(
+            return comment_id, UnassignedRoutingDecision(
                 action="create_new_group",
                 target_group_id="",
                 reason="No existing candidate clusters",
             )
-        return await self._ainvoke_chain(
+        decision = await self._ainvoke_chain(
             self._unassigned_chain,
             {
                 "comment_card": self._format_comment_card(comment),
@@ -455,16 +610,17 @@ class AgenticPostProcessingPipeline:
             fallback=UnassignedRoutingDecision(
                 action="create_new_group",
                 target_group_id="",
-                reason="No confident existing cluster match",
+                reason="Fallback: no safe existing cluster",
             ),
         )
+        return comment_id, decision
 
     async def _rename_groups(
         self,
         groups_by_id: dict[str, dict[str, Any]],
         comments_by_id: dict[str, dict[str, Any]],
     ) -> None:
-        async def rename_group(group_id: str, group: dict[str, Any]) -> tuple[str, str]:
+        async def rename_one(group_id: str, group: dict[str, Any]) -> tuple[str, str]:
             members = self._unique_group_comments(group, comments_by_id)
             fallback_name = self._fallback_group_name(members)
             decision = await self._ainvoke_chain(
@@ -475,7 +631,7 @@ class AgenticPostProcessingPipeline:
             return group_id, _clean_text(decision.group_name) or fallback_name
 
         tasks = [
-            rename_group(group_id, group)
+            rename_one(group_id, group)
             for group_id, group in groups_by_id.items()
             if group.get("member_comment_ids")
         ]
@@ -488,7 +644,7 @@ class AgenticPostProcessingPipeline:
             async with self._llm_semaphore:
                 return await chain.ainvoke(payload)
         except Exception as exc:
-            logger.error("Agentic post-processing chain failed, using fallback: %s", exc)
+            logger.error("Agentic post-processing worker failed, using fallback: %s", exc)
             return fallback
 
     @staticmethod
@@ -497,90 +653,102 @@ class AgenticPostProcessingPipeline:
     ) -> tuple[dict[str, dict[str, Any]], dict[str, dict[str, Any]]]:
         return copy.deepcopy(state["comments_by_id"]), copy.deepcopy(state["groups_by_id"])
 
-    def _build_state_summary(self, state: AgenticPostProcessingState) -> str:
-        singleton_group_ids = self._singleton_group_ids(state)
-        unassigned_comment_ids = self._unassigned_comment_ids(state)
-        pending_audit_group_ids = self._pending_audit_group_ids(state)
-        return "\n".join(
-            [
-                f"Total comments: {len(state['comments_by_id'])}",
-                f"Non-empty clusters: {len(state['groups_by_id'])}",
-                f"Singleton clusters: {len(singleton_group_ids)}",
-                f"Unassigned comments: {len(unassigned_comment_ids)}",
-                f"Clusters pending audit: {len(pending_audit_group_ids)}",
-                f"No-change rounds: {state.get('no_change_rounds', 0)}",
-                "",
-                "Singleton cluster examples:",
-                self._preview_groups(state, singleton_group_ids),
-                "",
-                "Clusters pending audit:",
-                self._preview_groups(state, pending_audit_group_ids),
-                "",
-                "Unassigned comments:",
-                self._preview_unassigned(state, unassigned_comment_ids),
-            ]
-        )
-
-    def _preview_groups(self, state: AgenticPostProcessingState, group_ids: list[str]) -> str:
-        if not group_ids:
-            return "- none"
-        previews: list[str] = []
-        for group_id in group_ids[: self._planner_preview_group_limit]:
-            group = state["groups_by_id"].get(group_id)
-            if not group:
-                continue
-            member_ids = group.get("member_comment_ids", [])
-            sample = ""
-            if member_ids:
-                sample_comment = state["comments_by_id"][member_ids[0]]
-                sample = _truncate_text(sample_comment.get("normalized_text") or sample_comment.get("raw_text") or "")
-            previews.append(f"- {group_id} | {group.get('group_name') or 'Not named'} | size={len(member_ids)} | {sample}")
-        return "\n".join(previews) or "- none"
-
-    def _preview_unassigned(self, state: AgenticPostProcessingState, comment_ids: list[str]) -> str:
-        if not comment_ids:
-            return "- none"
-        return "\n".join(
-            f"- {comment_id} | {_truncate_text(state['comments_by_id'][comment_id].get('normalized_text') or state['comments_by_id'][comment_id].get('raw_text') or '')}"
-            for comment_id in comment_ids[: self._planner_preview_group_limit]
-        )
-
-    def _planner_fallback(self, state: AgenticPostProcessingState) -> PlannerDecision:
-        if self._unassigned_comment_ids(state):
-            return PlannerDecision(next_step="route_unassigned", reason="There are unassigned comments")
-        if self._singleton_group_ids(state) and state.get("no_change_rounds", 0) == 0:
-            return PlannerDecision(next_step="resolve_singletons", reason="There are singleton clusters to check")
-        if self._pending_audit_group_ids(state):
-            return PlannerDecision(next_step="audit_group", reason="There are clusters pending audit")
-        return PlannerDecision(next_step="finish", reason="No obvious remaining clustering issues")
-
-    def _needs_llm_review(self, state: AgenticPostProcessingState) -> bool:
-        return bool(
-            self._unassigned_comment_ids(state)
-            or self._singleton_group_ids(state)
-            or self._pending_audit_group_ids(state)
-        )
-
     def _build_action_update(
         self,
         state: AgenticPostProcessingState,
-        change_count: int,
+        *,
+        applied_changes: int,
+        processed_items: int,
         comments_by_id: dict[str, dict[str, Any]],
         groups_by_id: dict[str, dict[str, Any]],
-        pending_audit_group_ids: list[str],
-        *,
+        audit_queue: list[str],
+        accepted_singleton_group_ids: list[str] | None = None,
+        audit_attempts_by_group_id: dict[str, int] | None = None,
         next_group_index: int | None = None,
+        last_patch_summary: dict[str, Any],
     ) -> dict[str, Any]:
-        logger.info("Agentic action finished: %d changes", change_count)
-        return {
+        next_state: AgenticPostProcessingState = {
+            **state,
             "comments_by_id": comments_by_id,
             "groups_by_id": groups_by_id,
-            "pending_audit_group_ids": self._pending_audit_group_ids(
-                {"groups_by_id": groups_by_id, "pending_audit_group_ids": pending_audit_group_ids}
-            ),
-            "no_change_rounds": int(state.get("no_change_rounds", 0)) + 1 if change_count == 0 else 0,
-            "next_group_index": next_group_index if next_group_index is not None else int(state.get("next_group_index", 1)),
+            "audit_queue": audit_queue,
+            "accepted_singleton_group_ids": accepted_singleton_group_ids
+            if accepted_singleton_group_ids is not None
+            else list(state.get("accepted_singleton_group_ids", [])),
+            "audit_attempts_by_group_id": audit_attempts_by_group_id
+            if audit_attempts_by_group_id is not None
+            else dict(state.get("audit_attempts_by_group_id", {})),
+            "next_group_index": next_group_index
+            if next_group_index is not None
+            else int(state.get("next_group_index", 1)),
+            "round_index": int(state.get("round_index", 0)) + 1,
+            "no_change_rounds": int(state.get("no_change_rounds", 0)) + 1
+            if processed_items == 0 and applied_changes == 0
+            else 0,
+            "last_patch_summary": last_patch_summary,
         }
+        next_state.update(self._build_queue_update(next_state))
+        logger.info(
+            "Agentic action finished: step=%s, workers=%s, processed=%s, changes=%s",
+            last_patch_summary.get("step"),
+            last_patch_summary.get("workers"),
+            processed_items,
+            applied_changes,
+        )
+        return {
+            "comments_by_id": next_state["comments_by_id"],
+            "groups_by_id": next_state["groups_by_id"],
+            "singleton_queue": next_state["singleton_queue"],
+            "audit_queue": next_state["audit_queue"],
+            "unassigned_queue": next_state["unassigned_queue"],
+            "accepted_singleton_group_ids": next_state["accepted_singleton_group_ids"],
+            "audit_attempts_by_group_id": next_state["audit_attempts_by_group_id"],
+            "next_group_index": next_state["next_group_index"],
+            "round_index": next_state["round_index"],
+            "no_change_rounds": next_state["no_change_rounds"],
+            "last_patch_summary": next_state["last_patch_summary"],
+        }
+
+    def _build_queue_update(self, state: AgenticPostProcessingState) -> dict[str, list[str]]:
+        groups_by_id = state["groups_by_id"]
+        comments_by_id = state["comments_by_id"]
+        accepted_singleton_group_ids = [
+            group_id
+            for group_id in state.get("accepted_singleton_group_ids", [])
+            if group_id in groups_by_id and len(groups_by_id[group_id].get("member_comment_ids", [])) == 1
+        ]
+        accepted = set(accepted_singleton_group_ids)
+        audit_attempts = dict(state.get("audit_attempts_by_group_id", {}))
+        return {
+            "unassigned_queue": self._unassigned_comment_ids(state),
+            "singleton_queue": [
+                group_id
+                for group_id, group in sorted(groups_by_id.items())
+                if len(group.get("member_comment_ids", [])) == 1 and group_id not in accepted
+            ],
+            "audit_queue": self._valid_audit_queue(state, groups_by_id, audit_attempts),
+            "accepted_singleton_group_ids": accepted_singleton_group_ids,
+        }
+
+    def _valid_audit_queue(
+        self,
+        state: AgenticPostProcessingState,
+        groups_by_id: dict[str, dict[str, Any]],
+        audit_attempts: dict[str, int] | None = None,
+    ) -> list[str]:
+        audit_attempts = audit_attempts if audit_attempts is not None else dict(state.get("audit_attempts_by_group_id", {}))
+        seen: set[str] = set()
+        group_ids: list[str] = []
+        for group_id in state.get("audit_queue", []):
+            if group_id in seen:
+                continue
+            if group_id not in groups_by_id or len(groups_by_id[group_id].get("member_comment_ids", [])) <= 1:
+                continue
+            if audit_attempts.get(group_id, 0) >= self._max_audit_passes_per_group:
+                continue
+            group_ids.append(group_id)
+            seen.add(group_id)
+        return group_ids
 
     def _move_comment(
         self,
@@ -598,7 +766,6 @@ class AgenticPostProcessingPipeline:
             return False
         self._remove_comment_from_group(groups_by_id, source_group_id, comment_id)
         self._assign_comment_to_group(comments_by_id, groups_by_id, comment_id, target_group_id, reason)
-        comment.setdefault("postprocessing_trace", []).append(f"{source_group_id} -> {target_group_id}: {reason}")
         if source_group_id in groups_by_id and not groups_by_id[source_group_id]["member_comment_ids"]:
             groups_by_id.pop(source_group_id, None)
         return True
@@ -642,6 +809,9 @@ class AgenticPostProcessingPipeline:
     @staticmethod
     def _create_group(groups_by_id: dict[str, dict[str, Any]], next_group_index: int) -> tuple[str, int]:
         group_id = f"group_{next_group_index:04d}"
+        while group_id in groups_by_id:
+            next_group_index += 1
+            group_id = f"group_{next_group_index:04d}"
         groups_by_id[group_id] = {"group_id": group_id, "group_name": "", "member_comment_ids": []}
         return group_id, next_group_index + 1
 
@@ -657,21 +827,32 @@ class AgenticPostProcessingPipeline:
 
     def _mark_group_for_audit(
         self,
-        pending_audit_group_ids: list[str],
+        audit_queue: list[str],
+        state: AgenticPostProcessingState,
         groups_by_id: dict[str, dict[str, Any]],
         group_id: str,
+        audit_attempts_by_group_id: dict[str, int] | None = None,
     ) -> list[str]:
-        if group_id not in groups_by_id or len(groups_by_id[group_id].get("member_comment_ids", [])) <= 1:
-            return self._remove_group_from_audit_queue(pending_audit_group_ids, group_id)
-        queue = [existing_group_id for existing_group_id in pending_audit_group_ids if existing_group_id != group_id]
+        attempts = audit_attempts_by_group_id if audit_attempts_by_group_id is not None else dict(state.get("audit_attempts_by_group_id", {}))
+        if (
+            group_id not in groups_by_id
+            or len(groups_by_id[group_id].get("member_comment_ids", [])) <= 1
+            or attempts.get(group_id, 0) >= self._max_audit_passes_per_group
+        ):
+            return self._remove_group_from_queue(audit_queue, group_id)
+        queue = [existing_group_id for existing_group_id in audit_queue if existing_group_id != group_id]
         return [group_id, *queue]
 
     @staticmethod
-    def _remove_group_from_audit_queue(pending_audit_group_ids: list[str], group_id: str) -> list[str]:
-        return [existing_group_id for existing_group_id in pending_audit_group_ids if existing_group_id != group_id]
+    def _remove_group_from_queue(queue: list[str], group_id: str) -> list[str]:
+        return [existing_group_id for existing_group_id in queue if existing_group_id != group_id]
 
     @staticmethod
-    def _initial_pending_audit_groups(groups_by_id: dict[str, dict[str, Any]]) -> list[str]:
+    def _merge_unique(existing: list[str], additions: list[str]) -> list[str]:
+        return list(dict.fromkeys([*existing, *additions]))
+
+    @staticmethod
+    def _initial_audit_queue(groups_by_id: dict[str, dict[str, Any]]) -> list[str]:
         return [
             group["group_id"]
             for group in sorted(groups_by_id.values(), key=lambda item: (-len(item.get("member_comment_ids", [])), item["group_id"]))
@@ -679,30 +860,14 @@ class AgenticPostProcessingPipeline:
         ]
 
     @staticmethod
-    def _pending_audit_group_ids(state: AgenticPostProcessingState) -> list[str]:
-        groups_by_id = state["groups_by_id"]
-        seen: set[str] = set()
-        group_ids: list[str] = []
-        for group_id in state.get("pending_audit_group_ids", []):
-            if group_id in groups_by_id and len(groups_by_id[group_id].get("member_comment_ids", [])) > 1 and group_id not in seen:
-                group_ids.append(group_id)
-                seen.add(group_id)
-        return group_ids
-
-    @staticmethod
-    def _singleton_group_ids(state: AgenticPostProcessingState) -> list[str]:
-        return [
-            group_id
-            for group_id, group in sorted(state["groups_by_id"].items())
-            if len(group.get("member_comment_ids", [])) == 1
-        ]
-
-    @staticmethod
     def _unassigned_comment_ids(state: AgenticPostProcessingState) -> list[str]:
+        comments_by_id = state["comments_by_id"]
         return [
             comment_id
-            for comment_id, comment in state["comments_by_id"].items()
-            if not str(comment.get("group_id", "")).strip() and comment.get("decision_type") != "undefined"
+            for comment_id in state.get("comment_order", list(comments_by_id))
+            if comment_id in comments_by_id
+            and not str(comments_by_id[comment_id].get("group_id", "")).strip()
+            and str(comments_by_id[comment_id].get("decision_type", "")).lower() not in {"undefined", "decisiontype.undefined"}
         ]
 
     @staticmethod
@@ -724,10 +889,14 @@ class AgenticPostProcessingPipeline:
             ]
         )
 
-    def _format_group_card(self, group: dict[str, Any], comments_by_id: dict[str, dict[str, Any]], *, include_all_members: bool) -> str:
-        member_ids = list(group.get("member_comment_ids", []))
-        if not include_all_members:
-            member_ids = member_ids[: self._max_examples_per_candidate_group]
+    def _format_group_card(
+        self,
+        group: dict[str, Any],
+        comments_by_id: dict[str, dict[str, Any]],
+        *,
+        member_limit: int,
+    ) -> str:
+        member_ids = list(group.get("member_comment_ids", []))[:member_limit]
         members = [
             f"- {comment_id} | normalized: {_clean_text(comment.get('normalized_text') or comment.get('raw_text') or '')} | raw: {_truncate_text(comment.get('raw_text', ''), limit=180)}"
             for comment_id in member_ids
@@ -738,17 +907,19 @@ class AgenticPostProcessingPipeline:
                 f"group_id: {group['group_id']}",
                 f"group_name: {_clean_text(group.get('group_name', '')) or 'Not named'}",
                 f"size: {len(group.get('member_comment_ids', []))}",
+                f"shown_members: {len(members)}",
                 "members:",
                 *members,
             ]
         )
 
-    def _build_all_cluster_candidates(
+    def _build_cluster_candidates(
         self,
         *,
         comments_by_id: dict[str, dict[str, Any]],
         groups_by_id: dict[str, dict[str, Any]],
         exclude_group_ids: set[str],
+        limit: int,
     ) -> list[dict[str, Any]]:
         candidates: list[dict[str, Any]] = []
         for group in sorted(groups_by_id.values(), key=lambda item: (-len(item.get("member_comment_ids", [])), item["group_id"])):
@@ -772,6 +943,8 @@ class AgenticPostProcessingPipeline:
                     ],
                 }
             )
+            if len(candidates) >= limit:
+                break
         return candidates
 
     @staticmethod
