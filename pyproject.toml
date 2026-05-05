@@ -1,7 +1,7 @@
 [project]
 name = "clusteringtextdata"
 version = "0.1.0"
-description = "Add your description here"
+description = "Library for vector and LLM based clustering of text comments"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
@@ -12,3 +12,11 @@ dependencies = [
     "openpyxl>=3.1.5",
     "rank-bm25>=0.2.2",
 ]
+
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["clusteringtextdata", "src"]

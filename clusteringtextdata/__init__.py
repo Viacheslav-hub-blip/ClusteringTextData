@@ -1,4 +1,4 @@
-"""Библиотека кластеризации текстовых комментариев.
+"""Публичный пакет ``clusteringtextdata``.
 
 Файл содержит публичные импорты:
 - ``PrimaryPromptConfig``;
@@ -10,8 +10,13 @@
 
 from __future__ import annotations
 
-from .config import AgenticPromptConfig, ClusteringPromptConfig, PrimaryPromptConfig
-from .pipelines import VectorLLMAgenticClusteringPipeline, VectorLLMClusteringPipeline
+from src import (
+    AgenticPromptConfig,
+    ClusteringPromptConfig,
+    PrimaryPromptConfig,
+    VectorLLMAgenticClusteringPipeline,
+    VectorLLMClusteringPipeline,
+)
 
 __all__ = [
     "AgenticPromptConfig",
