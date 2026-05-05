@@ -1608,10 +1608,38 @@ class AgenticPostProcessingPipeline:
             comments_by_id: CommentsById,
             groups_by_id: GroupsById,
     ) -> dict[str, Any]:
-        """Собирает финальный результат в исходном порядке комментариев."""
+        """Собирает финальный результат в исходном порядке комментариев.
+
+        Args:
+            state: Текущее состояние графа постобработки.
+            comments_by_id: Комментарии, сгруппированные по идентификатору комментария.
+            groups_by_id: Финальные группы, сгруппированные по техническому идентификатору.
+
+        Returns:
+            Словарь с публичным результатом. Комментарии не содержат embeddings и технических
+            номеров групп, вместо них возвращается человекочитаемое название группы.
+        """
+        def build_public_comment(comment: Comment) -> Comment:
+            """Преобразует внутренний комментарий в публичную строку результата.
+
+            Args:
+                comment: Внутренний словарь комментария с техническими полями.
+
+            Returns:
+                Словарь комментария без embeddings и технических ID группы, но с ``group_name``.
+            """
+            public_comment = copy.deepcopy(comment)
+            group_id = str(public_comment.get("group_id", "")).strip()
+            group = groups_by_id.get(group_id, {})
+            public_comment["group_name"] = str(group.get("group_name", "")).strip() or "Без названия"
+            public_comment.pop("embedding", None)
+            public_comment.pop("group_id", None)
+            public_comment.pop("initial_group_id", None)
+            return public_comment
+
         return {
             "comments": [
-                comments_by_id[comment_id]
+                build_public_comment(comments_by_id[comment_id])
                 for comment_id in state["comment_order"]
                 if comment_id in comments_by_id
             ],

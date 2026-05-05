@@ -102,7 +102,7 @@ class VectorLLMAgenticClusteringPipeline:
         Returns:
             Финальный результат кластеризации.
         """
-        primary_result = await self._primary_pipeline.arun(raw_comments)
+        primary_result = await self._primary_pipeline.arun_internal(raw_comments)
         return await self._agentic_pipeline.arun(primary_result)
 
 

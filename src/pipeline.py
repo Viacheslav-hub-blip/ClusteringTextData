@@ -319,20 +319,39 @@ class CommentMemoryStore:
                     stored.group_id = target.group_id
             self._groups.pop(group.group_id, None)
 
-    def comment_outputs(self) -> list[dict]:
-        """Сериализует все комментарии в порядке обработки."""
-        return [
-            {
-                "comment_id": c.comment_id,
-                "raw_text": c.raw_text,
-                "normalized_text": c.normalized_text,
-                "embedding": c.embedding,
-                "group_id": c.group_id,
-                "decision_type": c.decision_type.value,
-                "decision_reason": c.decision_reason,
+    def comment_outputs(
+            self,
+            *,
+            include_embeddings: bool = False,
+            include_group_id: bool = False,
+    ) -> list[dict]:
+        """Сериализует комментарии в порядке обработки.
+
+        Args:
+            include_embeddings: Если ``True``, добавляет техническое поле ``embedding``.
+            include_group_id: Если ``True``, добавляет технический идентификатор группы ``group_id``.
+
+        Returns:
+            Список словарей с данными комментариев. По умолчанию результат не содержит embeddings,
+            а вместо технического номера группы содержит человекочитаемое поле ``group_name``.
+        """
+        comments = []
+        for comment in (self._comments[cid] for cid in self._ordered_ids):
+            group = self._groups.get(comment.group_id)
+            output = {
+                "comment_id": comment.comment_id,
+                "raw_text": comment.raw_text,
+                "normalized_text": comment.normalized_text,
+                "group_name": (group.group_name if group else "") or "Не определено",
+                "decision_type": comment.decision_type.value,
+                "decision_reason": comment.decision_reason,
             }
-            for c in (self._comments[cid] for cid in self._ordered_ids)
-        ]
+            if include_embeddings:
+                output["embedding"] = comment.embedding
+            if include_group_id:
+                output["group_id"] = comment.group_id
+            comments.append(output)
+        return comments
 
     def group_outputs(self) -> list[dict]:
         """Сериализует все группы в порядке их ID."""
@@ -509,7 +528,42 @@ class IncrementalMVPClusteringPipeline:
         self._store.merge_groups_by_name()
         print("\rПайплайн завершён".ljust(80))
 
-        return {"comments": self._store.comment_outputs(), "groups": self._store.group_outputs()}
+        return self._build_output()
+
+    async def arun_internal(self, raw_comments: list[dict]) -> dict[str, list[dict]]:
+        """Запускает pipeline и возвращает технический результат для внутренних этапов.
+
+        Args:
+            raw_comments: Список словарей с исходными комментариями.
+
+        Returns:
+            Словарь с ``comments`` и ``groups``, где комментарии содержат ``embedding`` и ``group_id``.
+        """
+        await self.arun(raw_comments)
+        return self._build_output(include_embeddings=True, include_group_id=True)
+
+    def _build_output(
+            self,
+            *,
+            include_embeddings: bool = False,
+            include_group_id: bool = False,
+    ) -> dict[str, list[dict]]:
+        """Собирает результат pipeline в публичном или техническом формате.
+
+        Args:
+            include_embeddings: Если ``True``, включает embeddings в комментарии.
+            include_group_id: Если ``True``, включает технические ID групп в комментарии.
+
+        Returns:
+            Словарь с ключами ``comments`` и ``groups``.
+        """
+        return {
+            "comments": self._store.comment_outputs(
+                include_embeddings=include_embeddings,
+                include_group_id=include_group_id,
+            ),
+            "groups": self._store.group_outputs(),
+        }
 
     @staticmethod
     def _validate(raw_comments: list[dict]) -> list[InputComment]:
