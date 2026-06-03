@@ -1,36 +1,38 @@
-"""Инкрементальный MVP пайплайн: нормализация, поиск, решение, сохранение и нейминг групп."""
+"""Упрощенный pipeline кластеризации комментариев через FAISS, BM25 и LLM.
+
+Файл содержит:
+- ``run_coroutine_sync`` — безопасный синхронный запуск coroutine из IDE и Jupyter;
+- ``render_progress_bar`` — форматирование прогресса для консоли;
+- ``preprocess_text`` — минимальная техническая предобработка текста;
+- ``tokenize_for_bm25`` — токенизация текста для BM25;
+- ``truncate_text`` — сокращение длинных строк для prompt-ов;
+- ``SimpleHybridMemoryStore`` — in-memory хранилище комментариев, групп, FAISS и BM25;
+- ``SimpleGroupDecisionEngine`` — LLM-решение о выборе существующей или новой группы;
+- ``SimpleFaissBM25LLMClusteringPipeline`` — основной pipeline кластеризации.
+"""
 
 from __future__ import annotations
 
 import asyncio
 import logging
 import re
+import threading
+from dataclasses import dataclass, field
+from typing import Any
 
-from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
 from langchain_community.vectorstores.faiss import DistanceStrategy
-from langchain_core.documents import Document
 from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 from langchain_core.output_parsers import JsonOutputParser
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_classic.retrievers import EnsembleRetriever
+from rank_bm25 import BM25Okapi
 
-from .models import (
-    CandidateGroup,
-    CommentGroup,
-    DecisionType,
-    InputComment,
-    NormalizationResult,
-    PrimaryDecision,
-    SimilarityHit,
-    StoredComment,
-)
 from .config import PrimaryPromptConfig
+from .prompts import EMPTY_HUMAN_MESSAGE
 
 logger = logging.getLogger(__name__)
 
-# Таблица замены типографских символов на ASCII-аналоги
 _QUOTE_MAP = str.maketrans({
     "\u2018": "'", "\u2019": "'",
     "\u201c": '"', "\u201d": '"',
@@ -39,691 +41,849 @@ _QUOTE_MAP = str.maketrans({
 })
 
 
+def run_coroutine_sync(coro: Any) -> Any:
+    """Запускает coroutine из обычной IDE и из окружений с активным event loop.
+
+    Args:
+        coro: Coroutine-объект, который нужно выполнить синхронно.
+
+    Returns:
+        Результат выполнения coroutine.
+
+    Raises:
+        BaseException: Пробрасывает исключение, возникшее внутри coroutine.
+    """
+    try:
+        asyncio.get_running_loop()
+    except RuntimeError:
+        return asyncio.run(coro)
+
+    result: dict[str, Any] = {}
+
+    def runner() -> None:
+        """Выполняет coroutine в отдельном потоке с собственным event loop.
+
+        Args:
+            Входные аргументы отсутствуют, coroutine берется из внешней области видимости.
+
+        Returns:
+            ``None``. Результат или исключение сохраняются во внешнем словаре.
+        """
+        try:
+            result["value"] = asyncio.run(coro)
+        except BaseException as exc:  # noqa: BLE001
+            result["error"] = exc
+
+    thread = threading.Thread(target=runner, daemon=True)
+    thread.start()
+    thread.join()
+
+    if "error" in result:
+        raise result["error"]
+    return result.get("value")
+
+
 def render_progress_bar(current: int, total: int, *, width: int = 24) -> str:
-    """Рендерит ASCII прогресс-бар для вывода в консоль."""
+    """Рендерит ASCII прогресс-бар для консольного вывода.
+
+    Args:
+        current: Количество уже обработанных элементов.
+        total: Общее количество элементов.
+        width: Ширина визуальной части прогресс-бара.
+
+    Returns:
+        Строка с прогресс-баром и счетчиком элементов.
+    """
     total = max(total, 1)
     current = max(0, min(current, total))
     filled = int(width * current / total)
     return f"[{'#' * filled}{'.' * (width - filled)}] {current}/{total}"
 
 
-def technical_normalize(value: str) -> str:
-    """Техническая нормализация текста: замена типографики и схлопывание пробелов."""
-    return re.sub(r"\s+", " ", str(value).translate(_QUOTE_MAP)).strip()
+def preprocess_text(value: str) -> str:
+    """Выполняет минимальную техническую предобработку комментария.
+
+    Args:
+        value: Исходный текст комментария.
+
+    Returns:
+        Текст в нижнем регистре со схлопнутыми пробелами, повторяющейся пунктуацией и ``ё``.
+    """
+    text = str(value).translate(_QUOTE_MAP).lower().replace("ё", "е")
+    text = re.sub(r"([!?.,;:])\1+", r"\1", text)
+    text = re.sub(r"\s+", " ", text)
+    return text.strip()
 
 
-def normalize_for_match(value: str) -> str:
-    """Агрессивная нормализация для сравнения строк: lowercase, только буквы/цифры/дефис."""
-    value = technical_normalize(value).lower().replace("ё", "е")
-    return re.sub(r"\s+", " ", re.sub(r"[^0-9a-zа-я\s-]+", " ", value, flags=re.IGNORECASE)).strip()
+def tokenize_for_bm25(value: str) -> list[str]:
+    """Разбивает текст на токены для BM25-поиска.
+
+    Args:
+        value: Предобработанный или исходный текст комментария.
+
+    Returns:
+        Список токенов из букв и цифр.
+    """
+    return re.findall(r"[0-9a-zа-я]+", preprocess_text(value), flags=re.IGNORECASE)
 
 
-def coerce_bool(value: object, default: bool = False) -> bool:
-    """Конвертирует вывод LLM в bool, учитывая русские и английские варианты."""
-    if isinstance(value, bool):
-        return value
-    normalized = normalize_for_match(str(value))
-    if normalized in {"true", "1", "yes", "да"}:
-        return True
-    if normalized in {"false", "0", "no", "нет"}:
-        return False
-    return default
+def truncate_text(value: str, limit: int = 700) -> str:
+    """Сокращает длинный текст для компактного prompt-а.
+
+    Args:
+        value: Исходная строка.
+        limit: Максимальная длина результата.
+
+    Returns:
+        Строка не длиннее ``limit`` символов.
+    """
+    text = re.sub(r"\s+", " ", str(value)).strip()
+    return text if len(text) <= limit else text[: limit - 1].rstrip() + "..."
 
 
-def parse_decision_type(value: object) -> DecisionType | None:
-    """Конвертирует строку решения LLM в enum DecisionType, при неизвестном значении возвращает None."""
-    normalized = normalize_for_match(str(value)).replace(" ", "_")
-    for member in DecisionType:
-        if normalized == member.value:
-            return member
-    return None
+@dataclass(slots=True)
+class SimpleStoredComment:
+    """Сохраненный комментарий с исходными полями и назначенной группой.
+
+    Args:
+        comment_id: Внутренний идентификатор комментария.
+        source: Исходная строка данных в виде словаря.
+        raw_text: Исходный текст комментария.
+        processed_text: Предобработанный текст комментария.
+        embedding: Векторное представление комментария.
+        group_id: Идентификатор назначенной группы.
+
+    Returns:
+        Экземпляр комментария, сохраненный в памяти pipeline.
+    """
+
+    comment_id: str
+    source: dict[str, Any]
+    raw_text: str
+    processed_text: str
+    embedding: list[float]
+    group_id: str
 
 
-def truncate_text(value: str, limit: int = 10000) -> str:
-    """Обрезает длинный текст для промптов и fallback-имён."""
-    value = technical_normalize(value)
-    return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+@dataclass(slots=True)
+class SimpleCommentGroup:
+    """Группа комментариев, созданная pipeline.
+
+    Args:
+        group_id: Внутренний идентификатор группы.
+        group_name: Человекочитаемое название группы.
+        member_comment_ids: Идентификаторы комментариев, входящих в группу.
+
+    Returns:
+        Экземпляр группы комментариев.
+    """
+
+    group_id: str
+    group_name: str
+    member_comment_ids: list[str] = field(default_factory=list)
 
 
-class CommentNormalizer:
-    """Нормализатор комментариев на основе LLM с локальным fallback."""
+@dataclass(slots=True)
+class SimpleCandidateGroup:
+    """Группа-кандидат для передачи в LLM.
 
-    def __init__(
+    Args:
+        group_id: Идентификатор группы-кандидата.
+        group_name: Текущее название группы.
+        score: Объединенный retrieval-score по FAISS и BM25.
+        representative_comment_ids: Идентификаторы примеров из группы.
+
+    Returns:
+        Экземпляр группы-кандидата с примерами для prompt-а.
+    """
+
+    group_id: str
+    group_name: str
+    score: float
+    representative_comment_ids: list[str]
+
+
+@dataclass(slots=True)
+class SimpleGroupDecision:
+    """Решение LLM о группе для одного комментария.
+
+    Args:
+        decision_type: ``existing_group`` или ``new_group``.
+        group_id: Идентификатор существующей группы или пустая строка.
+        group_name: Название новой группы или уточненное название существующей.
+        reason: Краткое объяснение решения.
+
+    Returns:
+        Экземпляр решения маршрутизации комментария.
+    """
+
+    decision_type: str
+    group_id: str
+    group_name: str
+    reason: str
+
+
+class SimpleHybridMemoryStore:
+    """Хранит комментарии, группы, FAISS-индекс и BM25-корпус в памяти.
+
+    Args:
+        embeddings: LangChain embedding-модель, необходимая FAISS при создании индекса.
+        bm25_top_k: Количество документов, извлекаемых через BM25.
+        faiss_top_k: Количество документов, извлекаемых через FAISS.
+
+    Returns:
+        Экземпляр in-memory хранилища для одного запуска pipeline.
+    """
+
+    def __init__(self, embeddings: Embeddings, *, bm25_top_k: int, faiss_top_k: int) -> None:
+        self._embeddings = embeddings
+        self._bm25_top_k = bm25_top_k
+        self._faiss_top_k = faiss_top_k
+        self._ordered_ids: list[str] = []
+        self._comments: dict[str, SimpleStoredComment] = {}
+        self._groups: dict[str, SimpleCommentGroup] = {}
+        self._vectorstore: FAISS | None = None
+        self._bm25: BM25Okapi | None = None
+        self._bm25_tokens: list[list[str]] = []
+        self._next_group_index = 1
+        self._bm25_dirty = True
+
+    def create_group(self, group_name: str) -> SimpleCommentGroup:
+        """Создает новую группу с последовательным идентификатором.
+
+        Args:
+            group_name: Название новой группы.
+
+        Returns:
+            Созданная группа комментариев.
+        """
+        group_id = f"group_{self._next_group_index:04d}"
+        self._next_group_index += 1
+        group = SimpleCommentGroup(group_id=group_id, group_name=group_name.strip() or group_id)
+        self._groups[group_id] = group
+        return group
+
+    def add_comment(self, comment: SimpleStoredComment) -> None:
+        """Добавляет комментарий в память, группу, FAISS и BM25-корпус.
+
+        Args:
+            comment: Подготовленный комментарий с назначенной группой.
+
+        Returns:
+            ``None``.
+        """
+        self._ordered_ids.append(comment.comment_id)
+        self._comments[comment.comment_id] = comment
+        self._groups[comment.group_id].member_comment_ids.append(comment.comment_id)
+        self._index_comment(comment)
+        self._bm25_tokens.append(tokenize_for_bm25(comment.processed_text))
+        self._bm25_dirty = True
+
+    def get_comment(self, comment_id: str) -> SimpleStoredComment:
+        """Возвращает комментарий по идентификатору.
+
+        Args:
+            comment_id: Идентификатор комментария.
+
+        Returns:
+            Сохраненный комментарий.
+        """
+        return self._comments[comment_id]
+
+    def get_group(self, group_id: str) -> SimpleCommentGroup | None:
+        """Возвращает группу по идентификатору.
+
+        Args:
+            group_id: Идентификатор группы.
+
+        Returns:
+            Группа комментариев или ``None``, если группа не найдена.
+        """
+        return self._groups.get(group_id)
+
+    def all_groups(self) -> list[SimpleCommentGroup]:
+        """Возвращает все группы в порядке создания.
+
+        Args:
+            Входные аргументы отсутствуют.
+
+        Returns:
+            Список групп комментариев.
+        """
+        return sorted(self._groups.values(), key=lambda group: group.group_id)
+
+    def search_candidates(
             self,
-            llm: BaseChatModel,
             *,
-            min_meaningful_length: int = 3,
-            llm_semaphore: asyncio.Semaphore,
-            prompt_config: PrimaryPromptConfig | None = None,
-    ):
-        prompt_config = prompt_config or PrimaryPromptConfig.default()
-        self._chain = (
-                ChatPromptTemplate.from_messages([
-                    ("system", prompt_config.normalization_system),
-                    ("human", prompt_config.normalization_human),
-                ])
-                | llm
-                | JsonOutputParser()
-        )
-        self._min_meaningful_length = min_meaningful_length
-        self._sem = llm_semaphore
+            query_text: str,
+            query_embedding: list[float],
+            candidate_group_limit: int,
+            max_examples_per_group: int,
+    ) -> list[SimpleCandidateGroup]:
+        """Ищет группы-кандидаты через FAISS и BM25.
 
-    def _is_noise(self, text: str) -> bool:
-        """Проверяет, является ли текст явным мусором по длине после нормализации."""
-        return len(normalize_for_match(text).replace(" ", "")) < self._min_meaningful_length
+        Args:
+            query_text: Предобработанный текст текущего комментария.
+            query_embedding: Вектор текущего комментария.
+            candidate_group_limit: Максимальное количество групп-кандидатов.
+            max_examples_per_group: Максимальное количество примеров на одну группу.
 
-    async def anormalize(self, text: str) -> NormalizationResult:
-        """Нормализует комментарий через LLM и определяет его осмысленность."""
+        Returns:
+            Список групп-кандидатов для LLM.
+        """
+        if not self._ordered_ids:
+            return []
+
+        ranked_comment_ids = self._search_faiss(query_embedding) + self._search_bm25(query_text)
+        group_scores: dict[str, float] = {}
+        group_examples: dict[str, list[str]] = {}
+
+        for rank, (comment_id, source_weight) in enumerate(ranked_comment_ids, start=1):
+            comment = self._comments.get(comment_id)
+            if comment is None:
+                continue
+            group_scores[comment.group_id] = group_scores.get(comment.group_id, 0.0) + source_weight / rank
+            examples = group_examples.setdefault(comment.group_id, [])
+            if len(examples) < max_examples_per_group and comment_id not in examples:
+                examples.append(comment_id)
+
+        candidates: list[SimpleCandidateGroup] = []
+        for group_id in sorted(group_scores, key=group_scores.get, reverse=True)[:candidate_group_limit]:
+            group = self._groups[group_id]
+            candidates.append(SimpleCandidateGroup(
+                group_id=group_id,
+                group_name=group.group_name,
+                score=group_scores[group_id],
+                representative_comment_ids=group_examples.get(group_id, [])[:max_examples_per_group],
+            ))
+        return candidates
+
+    def rows_with_group_name(self) -> list[dict[str, Any]]:
+        """Собирает строки результата в формате исходные поля плюс ``group_name``.
+
+        Args:
+            Входные аргументы отсутствуют.
+
+        Returns:
+            Список словарей, где в конце добавлено поле ``group_name``.
+        """
+        rows: list[dict[str, Any]] = []
+        for comment_id in self._ordered_ids:
+            comment = self._comments[comment_id]
+            group = self._groups[comment.group_id]
+            row = dict(comment.source)
+            row["group_name"] = group.group_name
+            rows.append(row)
+        return rows
+
+    def group_outputs(self) -> list[dict[str, Any]]:
+        """Собирает техническую информацию о группах.
+
+        Args:
+            Входные аргументы отсутствуют.
+
+        Returns:
+            Список словарей с идентификатором, названием и размером группы.
+        """
+        return [
+            {
+                "group_id": group.group_id,
+                "group_name": group.group_name,
+                "comment_count": len(group.member_comment_ids),
+            }
+            for group in self.all_groups()
+        ]
+
+    def _search_faiss(self, query_embedding: list[float]) -> list[tuple[str, float]]:
+        """Ищет похожие комментарии в FAISS.
+
+        Args:
+            query_embedding: Вектор текущего комментария.
+
+        Returns:
+            Список пар ``comment_id`` и веса источника retrieval.
+        """
+        if self._vectorstore is None:
+            return []
         try:
-            async with self._sem:
-                raw = await self._chain.ainvoke({"text": text})
-
-            normalized_text = technical_normalize(raw.get("normalized_text", text)) or technical_normalize(text)
-            is_meaningful = coerce_bool(raw.get("is_meaningful"), default=True)
-
-            if self._is_noise(normalized_text):
-                is_meaningful = False
-
-            reason = str(raw.get("reason", "")).strip() or (
-                "Комментарий содержит осмысленный кейс"
-                if is_meaningful
-                else "Комментарий пустой, шумный или бессодержательный"
-            )
-            return NormalizationResult(normalized_text=normalized_text, is_meaningful=is_meaningful, reason=reason)
-
+            docs = self._vectorstore.similarity_search_by_vector(query_embedding, k=self._faiss_top_k)
         except Exception as exc:
-            logger.error("Нормализация завершилась с ошибкой, применяется fallback: %s", exc)
-            normalized_text = technical_normalize(text)
-            is_meaningful = not self._is_noise(normalized_text)
-            return NormalizationResult(
-                normalized_text=normalized_text,
-                is_meaningful=is_meaningful,
-                reason=(
-                    "Комментарий содержит осмысленный кейс"
-                    if is_meaningful
-                    else "Комментарий пустой, шумный или бессодержательный"
-                ),
+            logger.error("FAISS-поиск завершился с ошибкой: %s", exc)
+            return []
+        return [(str(doc.metadata.get("comment_id", "")), 1.0) for doc in docs if doc.metadata.get("comment_id")]
+
+    def _search_bm25(self, query_text: str) -> list[tuple[str, float]]:
+        """Ищет похожие комментарии в BM25.
+
+        Args:
+            query_text: Предобработанный текст текущего комментария.
+
+        Returns:
+            Список пар ``comment_id`` и веса источника retrieval.
+        """
+        tokens = tokenize_for_bm25(query_text)
+        if not tokens or not self._bm25_tokens:
+            return []
+        if self._bm25_dirty or self._bm25 is None:
+            self._bm25 = BM25Okapi(self._bm25_tokens)
+            self._bm25_dirty = False
+        scores = self._bm25.get_scores(tokens)
+        ranked_indexes = sorted(range(len(scores)), key=lambda idx: scores[idx], reverse=True)
+        result: list[tuple[str, float]] = []
+        for index in ranked_indexes[:self._bm25_top_k]:
+            if scores[index] <= 0:
+                continue
+            result.append((self._ordered_ids[index], 0.8))
+        return result
+
+    def _index_comment(self, comment: SimpleStoredComment) -> None:
+        """Добавляет комментарий в FAISS-индекс.
+
+        Args:
+            comment: Комментарий с готовым embedding.
+
+        Returns:
+            ``None``.
+        """
+        text_embedding = [(comment.processed_text, comment.embedding)]
+        metadata = [{"comment_id": comment.comment_id, "group_id": comment.group_id}]
+        if self._vectorstore is None:
+            self._vectorstore = FAISS.from_embeddings(
+                text_embedding,
+                self._embeddings,
+                metadatas=metadata,
+                ids=[comment.comment_id],
+                normalize_L2=True,
+                distance_strategy=DistanceStrategy.EUCLIDEAN_DISTANCE,
             )
+            return
+        self._vectorstore.add_embeddings(text_embedding, metadatas=metadata, ids=[comment.comment_id])
 
 
-class GroupDecisionEngine:
-    """LLM для маршрутизации комментария: существующая группа или новая."""
+class SimpleGroupDecisionEngine:
+    """Запрашивает у LLM решение о группе для одного комментария.
+
+    Args:
+        llm: Chat-модель LangChain.
+        llm_semaphore: Semaphore для ограничения параллельных LLM-запросов.
+        max_retries: Количество повторных попыток LLM-вызова после первой ошибки.
+        prompt_config: Prompt-конфигурация выбора группы.
+
+    Returns:
+        Экземпляр decision engine для маршрутизации комментариев.
+    """
 
     def __init__(
             self,
             llm: BaseChatModel,
             *,
             llm_semaphore: asyncio.Semaphore,
+            max_retries: int = 1,
             prompt_config: PrimaryPromptConfig | None = None,
-    ):
+    ) -> None:
         prompt_config = prompt_config or PrimaryPromptConfig.default()
         self._chain = (
                 ChatPromptTemplate.from_messages([
                     ("system", prompt_config.primary_decision_system),
-                    ("human", prompt_config.primary_decision_human),
+                    ("human", EMPTY_HUMAN_MESSAGE),
                 ])
                 | llm
                 | JsonOutputParser()
         )
         self._sem = llm_semaphore
+        self._max_retries = max(0, max_retries)
 
     async def achoose_group(
             self,
             *,
             raw_text: str,
-            normalized_text: str,
+            processed_text: str,
             candidate_groups_text: str,
             candidate_group_ids: set[str],
-            fallback: PrimaryDecision,
-    ) -> PrimaryDecision:
-        """Запрашивает у LLM решение о группе комментария, при ошибке возвращает fallback."""
-        if not candidate_group_ids:
-            return PrimaryDecision(
-                decision_type=DecisionType.NEW_GROUP,
-                group_id="",
-                reason="Среди уже обработанных комментариев нет кандидатов для сравнения",
-            )
-        try:
-            async with self._sem:
-                raw = await self._chain.ainvoke({
-                    "raw_text": raw_text,
-                    "normalized_text": normalized_text,
-                    "candidate_groups": candidate_groups_text,
-                })
-
-            decision_type = parse_decision_type(raw.get("decision_type"))
-            group_id = str(raw.get("group_id", "")).strip()
-            reason = str(raw.get("reason", "")).strip() or fallback.reason
-
-            if decision_type == DecisionType.EXISTING_GROUP and group_id in candidate_group_ids:
-                return PrimaryDecision(decision_type=DecisionType.EXISTING_GROUP, group_id=group_id, reason=reason)
-            if decision_type == DecisionType.NEW_GROUP:
-                return PrimaryDecision(decision_type=DecisionType.NEW_GROUP, group_id="", reason=reason)
-
-        except Exception as exc:
-            logger.error("Решение о группе завершилось с ошибкой, применяется fallback: %s", exc)
-
-        return fallback
-
-
-class GroupNameGenerator:
-    """Генератор коротких имён групп на основе LLM с fallback."""
-
-    def __init__(
-            self,
-            llm: BaseChatModel,
-            *,
-            llm_semaphore: asyncio.Semaphore,
-            prompt_config: PrimaryPromptConfig | None = None,
-    ):
-        prompt_config = prompt_config or PrimaryPromptConfig.default()
-        self._chain = (
-                ChatPromptTemplate.from_messages([
-                    ("system", prompt_config.group_naming_system),
-                    ("human", prompt_config.group_naming_human),
-                ])
-                | llm
-                | JsonOutputParser()
-        )
-        self._sem = llm_semaphore
-
-    async def agenerate_name(self, examples_text: str, fallback_name: str) -> str:
-        """Генерирует короткое название группы по примерам комментариев."""
-        try:
-            async with self._sem:
-                raw = await self._chain.ainvoke({"group_examples": examples_text})
-            if group_name := technical_normalize(raw.get("group_name", "")):
-                return group_name
-        except Exception as exc:
-            logger.error("Нейминг группы завершился с ошибкой, применяется fallback: %s", exc)
-        return fallback_name or "Не определено"
-
-
-class CommentMemoryStore:
-    """In-memory хранилище комментариев и групп с гибридным поиском FAISS + BM25."""
-
-    def __init__(self, embeddings: Embeddings):
-        self._embeddings = embeddings
-        self._ordered_ids: list[str] = []
-        self._comments: dict[str, StoredComment] = {}
-        self._groups: dict[str, CommentGroup] = {}
-        self._vectorstore: FAISS | None = None
-        self._bm25: BM25Retriever | None = None
-        self._hybrid: EnsembleRetriever | None = None
-        self._dirty = True
-        self._next_group_index = 1
-
-    def create_group(self) -> CommentGroup:
-        """Создаёт новую пустую группу с уникальным последовательным ID."""
-        group_id = f"group_{self._next_group_index:04d}"
-        self._next_group_index += 1
-        group = CommentGroup(group_id=group_id)
-        self._groups[group_id] = group
-        return group
-
-    def add_comment(self, comment: StoredComment) -> None:
-        """Сохраняет комментарий, добавляет в группу и индексирует в FAISS если осмысленный."""
-        self._ordered_ids.append(comment.comment_id)
-        self._comments[comment.comment_id] = comment
-
-        if comment.group_id:
-            self._groups.setdefault(comment.group_id, CommentGroup(group_id=comment.group_id)).member_comment_ids.append(comment.comment_id)
-
-        if comment.decision_type != DecisionType.UNDEFINED and comment.group_id and comment.embedding and comment.normalized_text:
-            self._index_comment(comment)
-            self._dirty = True
-
-    def get_comment(self, comment_id: str) -> StoredComment:
-        """Возвращает комментарий по ID."""
-        return self._comments[comment_id]
-
-    def get_group_comments(self, group_id: str) -> list[StoredComment]:
-        """Возвращает все комментарии группы в порядке добавления."""
-        group = self._groups.get(group_id)
-        return [self._comments[cid] for cid in group.member_comment_ids] if group else []
-
-    def all_groups(self) -> list[CommentGroup]:
-        """Возвращает все группы в порядке их ID."""
-        return sorted(self._groups.values(), key=lambda g: g.group_id)
-
-    def indexed_count(self) -> int:
-        """Возвращает количество документов в FAISS-индексе."""
-        return len(self._vectorstore.index_to_docstore_id) if self._vectorstore else 0
-
-    def unique_group_comments(self, group_id: str) -> list[StoredComment]:
-        """Возвращает уникальные комментарии группы без нормализованных дубликатов."""
-        seen: set[str] = set()
-        result: list[StoredComment] = []
-        for comment in self.get_group_comments(group_id):
-            key = normalize_for_match(comment.normalized_text)
-            if key and key not in seen:
-                seen.add(key)
-                result.append(comment)
-        return result
-
-    def merge_groups_by_name(self) -> None:
-        """Сливает группы с одинаковыми нормализованными именами."""
-        canonical: dict[str, CommentGroup] = {}
-        for group in self.all_groups():
-            key = normalize_for_match(group.group_name)
-            if not key:
-                continue
-            if key not in canonical:
-                canonical[key] = group
-                continue
-            target = canonical[key]
-            for cid in group.member_comment_ids:
-                if cid not in target.member_comment_ids:
-                    target.member_comment_ids.append(cid)
-                if stored := self._comments.get(cid):
-                    stored.group_id = target.group_id
-            self._groups.pop(group.group_id, None)
-
-    def comment_outputs(
-            self,
-            *,
-            include_embeddings: bool = False,
-            include_group_id: bool = False,
-    ) -> list[dict]:
-        """Сериализует комментарии в порядке обработки.
+    ) -> SimpleGroupDecision:
+        """Возвращает решение LLM о существующей или новой группе.
 
         Args:
-            include_embeddings: Если ``True``, добавляет техническое поле ``embedding``.
-            include_group_id: Если ``True``, добавляет технический идентификатор группы ``group_id``.
+            raw_text: Исходный текст комментария.
+            processed_text: Предобработанный текст комментария.
+            candidate_groups_text: Текстовое описание групп-кандидатов.
+            candidate_group_ids: Допустимые идентификаторы групп-кандидатов.
 
         Returns:
-            Список словарей с данными комментариев. По умолчанию результат не содержит embeddings,
-            а вместо технического номера группы содержит человекочитаемое поле ``group_name``.
+            Валидированное решение LLM.
+
+        Raises:
+            RuntimeError: Если LLM-вызов не сработал после всех попыток.
+            ValueError: Если LLM вернула невалидный тип решения, несуществующий ``group_id``
+                или не вернула название для новой группы.
         """
-        comments = []
-        for comment in (self._comments[cid] for cid in self._ordered_ids):
-            group = self._groups.get(comment.group_id)
-            output = {
-                "comment_id": comment.comment_id,
-                "raw_text": comment.raw_text,
-                "normalized_text": comment.normalized_text,
-                "group_name": (group.group_name if group else "") or "Не определено",
-                "decision_type": comment.decision_type.value,
-                "decision_reason": comment.decision_reason,
-            }
-            if include_embeddings:
-                output["embedding"] = comment.embedding
-            if include_group_id:
-                output["group_id"] = comment.group_id
-            comments.append(output)
-        return comments
+        last_error: Exception | None = None
+        for attempt in range(self._max_retries + 1):
+            try:
+                raw = await self._invoke_once(
+                    raw_text=raw_text,
+                    processed_text=processed_text,
+                    candidate_groups_text=candidate_groups_text,
+                )
+                return self._parse_decision(raw, candidate_group_ids)
+            except Exception as exc:
+                last_error = exc
+                logger.error(
+                    "LLM-решение о группе не прошло проверку, попытка %d из %d: %s",
+                    attempt + 1,
+                    self._max_retries + 1,
+                    exc,
+                )
+        raise RuntimeError("LLM-решение о группе не сработало после всех retry-попыток.") from last_error
 
-    def group_outputs(self) -> list[dict]:
-        """Сериализует все группы в порядке их ID."""
-        return [
-            {"group_id": g.group_id, "group_name": g.group_name or "Не определено"}
-            for g in self.all_groups()
-        ]
+    @staticmethod
+    def _parse_decision(raw: dict[str, Any], candidate_group_ids: set[str]) -> SimpleGroupDecision:
+        """Валидирует JSON-ответ LLM и преобразует его в решение о группе.
 
-    async def asearch_similar(
+        Args:
+            raw: JSON-словарь, полученный от LLM.
+            candidate_group_ids: Допустимые идентификаторы групп-кандидатов.
+
+        Returns:
+            Валидированное решение о группе.
+
+        Raises:
+            ValueError: Если LLM вернула невалидный тип решения, недопустимый ``group_id``
+                или пустое название новой группы.
+        """
+        if not isinstance(raw, dict):
+            raise ValueError(f"LLM вернула не JSON-объект: {type(raw).__name__}.")
+
+        decision_type = str(raw.get("decision_type", "")).strip().lower()
+        group_id = str(raw.get("group_id", "")).strip()
+        group_name = str(raw.get("group_name", "") or raw.get("new_group_name", "")).strip()
+        reason = str(raw.get("reason", "")).strip()
+
+        if decision_type == "existing_group":
+            if group_id not in candidate_group_ids:
+                raise ValueError(
+                    f"LLM вернула недопустимый group_id '{group_id}'. "
+                    f"Допустимые группы: {sorted(candidate_group_ids)}"
+                )
+            return SimpleGroupDecision(
+                decision_type="existing_group",
+                group_id=group_id,
+                group_name=group_name,
+                reason=reason,
+            )
+
+        if decision_type == "new_group":
+            if not group_name:
+                raise ValueError("LLM выбрала new_group, но не вернула поле group_name.")
+            return SimpleGroupDecision(
+                decision_type="new_group",
+                group_id="",
+                group_name=group_name,
+                reason=reason,
+            )
+
+        raise ValueError(f"LLM вернула недопустимый decision_type: '{decision_type}'.")
+
+    async def _invoke_once(
             self,
-            query_text: str,
-            top_k: int,
             *,
-            max_hits_per_group: int | None = None,
-    ) -> list[SimilarityHit]:
-        """Гибридный поиск похожих комментариев через FAISS + BM25."""
-        if not self._vectorstore or not query_text.strip() or top_k <= 0:
-            return []
+            raw_text: str,
+            processed_text: str,
+            candidate_groups_text: str,
+    ) -> dict[str, Any]:
+        """Один раз вызывает LLM-цепочку выбора группы.
 
-        retriever = self._ensure_retriever(top_k=top_k)
-        if retriever is None:
-            return []
+        Args:
+            raw_text: Исходный текст комментария.
+            processed_text: Предобработанный текст комментария.
+            candidate_groups_text: Текстовое описание групп-кандидатов.
 
-        try:
-            documents = await retriever.ainvoke(query_text)
-        except Exception as exc:
-            logger.error("Гибридный поиск завершился с ошибкой: %s", exc)
-            return []
-
-        hits: list[SimilarityHit] = []
-        seen: set[str] = set()
-        total = max(len(documents), 1)
-
-        for rank, doc in enumerate(documents, start=1):
-            cid = str(doc.metadata.get("comment_id", "")).strip()
-            if not cid or cid in seen:
-                continue
-            stored = self._comments.get(cid)
-            if not stored or not stored.group_id or stored.decision_type == DecisionType.UNDEFINED:
-                continue
-            seen.add(cid)
-            hits.append(SimilarityHit(comment_id=cid, group_id=stored.group_id, similarity=1.0 - (rank - 1) / total))
-
-        if max_hits_per_group is None:
-            return hits[:top_k]
-
-        result, counts = [], {}
-        for hit in hits:
-            if counts.get(hit.group_id, 0) >= max_hits_per_group:
-                continue
-            result.append(hit)
-            counts[hit.group_id] = counts.get(hit.group_id, 0) + 1
-            if len(result) >= top_k:
-                break
-        return result
-
-    def _ensure_retriever(self, *, top_k: int) -> EnsembleRetriever | None:
-        """Лениво создаёт или обновляет гибридный retriever при изменении индекса."""
-        if not self._vectorstore:
-            return None
-
-        if self._hybrid and not self._dirty:
-            self._bm25.k = top_k
-            for r in self._hybrid.retrievers:
-                if hasattr(r, "search_kwargs"):
-                    r.search_kwargs.update({"k": top_k, "fetch_k": self.indexed_count()})
-            return self._hybrid
-
-        docs = [
-            Document(
-                page_content=c.normalized_text,
-                metadata={"comment_id": c.comment_id, "group_id": c.group_id},
-            )
-            for c in (self._comments[cid] for cid in self._ordered_ids)
-            if c.decision_type != DecisionType.UNDEFINED and c.group_id and c.normalized_text
-        ]
-        if not docs:
-            return None
-
-        dense = self._vectorstore.as_retriever(search_kwargs={"k": top_k, "fetch_k": self.indexed_count()})
-        self._bm25 = BM25Retriever.from_documents(docs, k=top_k)
-        self._hybrid = EnsembleRetriever(retrievers=[dense, self._bm25], weights=[0.6, 0.4], id_key="comment_id")
-        self._dirty = False
-        return self._hybrid
-
-    def _index_comment(self, comment: StoredComment) -> None:
-        """Добавляет комментарий в FAISS-индекс, создавая его при первом вызове."""
-        text_emb = [(comment.normalized_text, comment.embedding or [])]
-        meta = [{"comment_id": comment.comment_id, "group_id": comment.group_id}]
-
-        if self._vectorstore is None:
-            self._vectorstore = FAISS.from_embeddings(
-                text_emb, self._embeddings,
-                metadatas=meta, ids=[comment.comment_id],
-                normalize_L2=True, distance_strategy=DistanceStrategy.MAX_INNER_PRODUCT,
-            )
-        else:
-            self._vectorstore.add_embeddings(text_emb, metadatas=meta, ids=[comment.comment_id])
+        Returns:
+            JSON-словарь, разобранный ``JsonOutputParser``.
+        """
+        async with self._sem:
+            return await self._chain.ainvoke({
+                "raw_text": raw_text,
+                "normalized_text": processed_text,
+                "candidate_groups": candidate_groups_text,
+            })
 
 
-class IncrementalMVPClusteringPipeline:
-    """Инкрементальный пайплайн кластеризации комментариев через LLM и гибридный поиск."""
+class SimpleFaissBM25LLMClusteringPipeline:
+    """Кластеризует комментарии через минимальную предобработку, FAISS, BM25 и LLM.
+
+    Args:
+        llm: Chat-модель LangChain для выбора группы.
+        embeddings: Embedding-модель LangChain для построения векторов и FAISS.
+        text_field: Поле исходной строки, из которого берется текст комментария.
+        faiss_top_k: Количество ближайших комментариев из FAISS.
+        bm25_top_k: Количество ближайших комментариев из BM25.
+        candidate_group_limit: Максимальное количество групп-кандидатов для LLM.
+        max_examples_per_candidate_group: Максимальное количество примеров на группу-кандидат.
+        max_concurrent_llm_requests: Лимит параллельных LLM-запросов.
+        max_llm_retries: Количество повторных попыток LLM-вызова после первой ошибки.
+        max_embedding_retries: Количество повторных попыток batch embedding-вызова после первой ошибки.
+        prompt_config: Prompt-конфигурация LLM-решения.
+        show_progress: Если ``True``, печатает прогресс обработки.
+
+    Returns:
+        Экземпляр pipeline, который возвращает исходные строки с добавленным ``group_name``.
+    """
 
     def __init__(
             self,
             llm: BaseChatModel,
             embeddings: Embeddings,
             *,
-            retrieval_top_k: int = 12,
+            text_field: str = "text",
+            faiss_top_k: int = 20,
+            bm25_top_k: int = 20,
+            candidate_group_limit: int = 7,
             max_examples_per_candidate_group: int = 3,
-            min_meaningful_length: int = 3,
-            primary_similarity_threshold: float = 0.5,
             max_concurrent_llm_requests: int = 3,
-            max_concurrent_embedding_requests: int = 3,
+            max_llm_retries: int = 1,
+            max_embedding_retries: int = 1,
             prompt_config: PrimaryPromptConfig | None = None,
-    ):
-        prompt_config = prompt_config or PrimaryPromptConfig.default()
+            show_progress: bool = True,
+    ) -> None:
+        self._text_field = text_field
+        self._candidate_group_limit = candidate_group_limit
+        self._max_examples = max_examples_per_candidate_group
         self._embeddings = embeddings
         self._llm_sem = asyncio.Semaphore(max_concurrent_llm_requests)
-        self._emb_sem = asyncio.Semaphore(max_concurrent_embedding_requests)
-        self._normalizer = CommentNormalizer(
-            llm,
-            min_meaningful_length=min_meaningful_length,
-            llm_semaphore=self._llm_sem,
-            prompt_config=prompt_config,
-        )
-        self._decision_engine = GroupDecisionEngine(
+        self._max_embedding_retries = max(0, max_embedding_retries)
+        self._decision_engine = SimpleGroupDecisionEngine(
             llm,
             llm_semaphore=self._llm_sem,
+            max_retries=max_llm_retries,
             prompt_config=prompt_config,
         )
-        self._name_generator = GroupNameGenerator(
-            llm,
-            llm_semaphore=self._llm_sem,
-            prompt_config=prompt_config,
+        self._store = SimpleHybridMemoryStore(
+            embeddings,
+            bm25_top_k=bm25_top_k,
+            faiss_top_k=faiss_top_k,
         )
-        self._store = CommentMemoryStore(embeddings)
-        self._top_k = retrieval_top_k
-        self._max_examples = max_examples_per_candidate_group
-        self._threshold = primary_similarity_threshold
+        self._show_progress = show_progress
 
-    def run(self, raw_comments: list[dict]) -> dict[str, list[dict]]:
-        """Синхронная обёртка для запуска пайплайна без async контекста."""
-        return asyncio.run(self.arun(raw_comments))
+    def run(self, raw_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Синхронно запускает pipeline из IDE, скрипта или Jupyter Notebook.
 
-    async def arun(self, raw_comments: list[dict]) -> dict[str, list[dict]]:
-        """Запускает полный пайплайн: нормализация, кластеризация, нейминг, слияние."""
-        comments = self._validate(raw_comments)
-        total = len(comments)
-        logger.info("Инкрементальный MVP пайплайн запущен: %d комментариев", total)
+        Args:
+            raw_rows: Список исходных строк данных с непустым текстовым полем.
 
-        # Этап 1: параллельная подготовка (нормализация + эмбеддинги)
-        self._print("Подготовка комментариев", 0, total)
-        prepared = await asyncio.gather(*(self._prepare_comment(c) for c in comments))
-        self._print("Подготовка комментариев", total, total)
+        Returns:
+            Словарь с ключами ``rows`` и ``groups``.
+        """
+        return run_coroutine_sync(self.arun(raw_rows))
 
-        # Этап 2: последовательная кластеризация
-        # (каждый комментарий должен видеть уже добавленные группы)
-        self._print("Инкрементальная кластеризация", 0, total)
+    async def arun(self, raw_rows: list[dict[str, Any]]) -> dict[str, Any]:
+        """Асинхронно запускает pipeline.
+
+        Args:
+            raw_rows: Список исходных строк данных с непустым текстовым полем.
+
+        Returns:
+            Словарь с исходными строками и добавленным полем ``group_name``.
+        """
+        prepared = self._prepare_rows(raw_rows)
+        total = len(prepared)
+        self._print("Построение embeddings", 0, total)
+        embeddings = await self._build_embeddings([row["processed_text"] for row in prepared])
+        self._print("Построение embeddings", total, total)
+
+        self._print("Кластеризация", 0, total)
         step = max(1, total // 10)
-        for i, (comment, norm, emb) in enumerate(prepared, start=1):
-            await self._process_comment(comment, norm, emb)
-            if i == 1 or i == total or i % step == 0:
-                self._print("Инкрементальная кластеризация", i, total)
+        for index, (row, embedding) in enumerate(zip(prepared, embeddings, strict=True), start=1):
+            await self._process_row(row=row, embedding=embedding)
+            if index == 1 or index == total or index % step == 0:
+                self._print("Кластеризация", index, total)
 
-        # Этап 3: параллельный нейминг групп
-        groups = self._store.all_groups()
-        self._print("Нейминг групп", 0, len(groups))
-        await self._generate_group_names(groups)
-        self._print("Нейминг групп", len(groups), len(groups))
-
-        # Этап 4: слияние групп с одинаковыми именами
-        print("\rСлияние групп с одинаковыми именами".ljust(80))
-        self._store.merge_groups_by_name()
-        print("\rПайплайн завершён".ljust(80))
-
-        return self._build_output()
-
-    async def arun_internal(self, raw_comments: list[dict]) -> dict[str, list[dict]]:
-        """Запускает pipeline и возвращает технический результат для внутренних этапов.
-
-        Args:
-            raw_comments: Список словарей с исходными комментариями.
-
-        Returns:
-            Словарь с ``comments`` и ``groups``, где комментарии содержат ``embedding`` и ``group_id``.
-        """
-        await self.arun(raw_comments)
-        return self._build_output(include_embeddings=True, include_group_id=True)
-
-    def _build_output(
-            self,
-            *,
-            include_embeddings: bool = False,
-            include_group_id: bool = False,
-    ) -> dict[str, list[dict]]:
-        """Собирает результат pipeline в публичном или техническом формате.
-
-        Args:
-            include_embeddings: Если ``True``, включает embeddings в комментарии.
-            include_group_id: Если ``True``, включает технические ID групп в комментарии.
-
-        Returns:
-            Словарь с ключами ``comments`` и ``groups``.
-        """
+        self._print("Готово", total, total)
         return {
-            "comments": self._store.comment_outputs(
-                include_embeddings=include_embeddings,
-                include_group_id=include_group_id,
-            ),
+            "rows": self._store.rows_with_group_name(),
             "groups": self._store.group_outputs(),
         }
 
-    @staticmethod
-    def _validate(raw_comments: list[dict]) -> list[InputComment]:
-        """Конвертирует сырые словари во входные модели, подставляя порядковый номер если нет ID."""
-        return [
-            InputComment(
-                comment_id=str(raw.get("comment_id", "")).strip() or str(i),
-                text=str(raw.get("text", "")).strip(),
-            )
-            for i, raw in enumerate(raw_comments, start=1)
-        ]
+    def to_dataframe(self, result: dict[str, Any]) -> Any:
+        """Преобразует результат pipeline в pandas DataFrame.
 
-    async def _prepare_comment(
-            self, comment: InputComment
-    ) -> tuple[InputComment, NormalizationResult, list[float] | None]:
-        """Нормализует комментарий и генерирует эмбеддинг (если осмысленный)."""
-        norm = await self._normalizer.anormalize(comment.text)
-        emb = await self._build_embedding(norm.normalized_text) if norm.is_meaningful else None
-        return comment, norm, emb
+        Args:
+            result: Результат метода ``run`` или ``arun``.
 
-    async def _process_comment(
-            self,
-            comment: InputComment,
-            norm: NormalizationResult,
-            embedding: list[float] | None,
-    ) -> None:
-        """Кластеризует один комментарий: ищет похожие, спрашивает LLM, сохраняет."""
-        if not norm.is_meaningful:
-            self._store.add_comment(StoredComment(
-                comment_id=comment.comment_id, raw_text=comment.text,
-                normalized_text=norm.normalized_text, embedding=None,
-                group_id="", decision_type=DecisionType.UNDEFINED,
-                decision_reason=norm.reason,
-            ))
+        Returns:
+            ``pandas.DataFrame`` со всеми исходными полями и ``group_name``.
+
+        Raises:
+            ImportError: Если пакет ``pandas`` не установлен в окружении.
+        """
+        import pandas as pd
+
+        return pd.DataFrame(result["rows"])
+
+    def save_excel(self, result: dict[str, Any], output_path: str) -> None:
+        """Сохраняет результат pipeline в Excel-файл.
+
+        Args:
+            result: Результат метода ``run`` или ``arun``.
+            output_path: Путь к итоговому ``.xlsx`` файлу.
+
+        Returns:
+            ``None``.
+        """
+        from openpyxl import Workbook
+
+        rows = result["rows"]
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "clusters"
+        if not rows:
+            workbook.save(output_path)
             return
 
-        hits = await self._store.asearch_similar(
-            query_text=norm.normalized_text,
-            top_k=self._top_k,
-            max_hits_per_group=self._max_examples,
+        headers = list(rows[0].keys())
+        sheet.append(headers)
+        for row in rows:
+            sheet.append([row.get(header, "") for header in headers])
+        workbook.save(output_path)
+
+    def _prepare_rows(self, raw_rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        """Готовит строки к обработке без проверки пустых комментариев.
+
+        Args:
+            raw_rows: Список исходных строк данных.
+
+        Returns:
+            Список строк с внутренним ID, исходным текстом и предобработанным текстом.
+        """
+        prepared: list[dict[str, Any]] = []
+        for index, row in enumerate(raw_rows, start=1):
+            raw_text = str(row.get(self._text_field, "")).strip()
+            prepared.append({
+                "comment_id": str(row.get("comment_id", "")).strip() or str(index),
+                "source": dict(row),
+                "raw_text": raw_text,
+                "processed_text": preprocess_text(raw_text),
+            })
+        return prepared
+
+    async def _build_embeddings(self, texts: list[str]) -> list[list[float]]:
+        """Строит embeddings для всех комментариев.
+
+        Args:
+            texts: Список предобработанных текстов.
+
+        Returns:
+            Список embedding-векторов в том же порядке.
+
+        Raises:
+            RuntimeError: Если batch embedding-вызов не сработал после всех попыток.
+        """
+        last_error: Exception | None = None
+        for attempt in range(self._max_embedding_retries + 1):
+            try:
+                return [list(vector) for vector in await self._embeddings.aembed_documents(texts)]
+            except Exception as exc:
+                last_error = exc
+                logger.error(
+                    "Batch embedding завершился с ошибкой, попытка %d из %d: %s",
+                    attempt + 1,
+                    self._max_embedding_retries + 1,
+                    exc,
+                )
+        raise RuntimeError("Batch embedding не сработал после всех retry-попыток.") from last_error
+
+    async def _process_row(self, *, row: dict[str, Any], embedding: list[float]) -> None:
+        """Назначает одной строке существующую или новую группу.
+
+        Args:
+            row: Подготовленная строка с исходным и предобработанным текстом.
+            embedding: Embedding-вектор текущего комментария.
+
+        Returns:
+            ``None``.
+        """
+        candidates = self._store.search_candidates(
+            query_text=row["processed_text"],
+            query_embedding=embedding,
+            candidate_group_limit=self._candidate_group_limit,
+            max_examples_per_group=self._max_examples,
         )
-        candidates = self._build_candidates(hits)
-        fallback = self._fallback_decision(norm.normalized_text, candidates)
         decision = await self._decision_engine.achoose_group(
-            raw_text=comment.text,
-            normalized_text=norm.normalized_text,
+            raw_text=row["raw_text"],
+            processed_text=row["processed_text"],
             candidate_groups_text=self._format_candidates(candidates),
-            candidate_group_ids={c.group_id for c in candidates},
-            fallback=fallback,
+            candidate_group_ids={candidate.group_id for candidate in candidates},
         )
 
-        group_id = (
-            decision.group_id
-            if decision.decision_type == DecisionType.EXISTING_GROUP and decision.group_id
-            else self._store.create_group().group_id
-        )
-        self._store.add_comment(StoredComment(
-            comment_id=comment.comment_id, raw_text=comment.text,
-            normalized_text=norm.normalized_text, embedding=embedding,
-            group_id=group_id, decision_type=decision.decision_type,
-            decision_reason=decision.reason,
+        if decision.decision_type == "existing_group":
+            group = self._store.get_group(decision.group_id)
+            if group is None:
+                raise ValueError(f"LLM выбрала несуществующую группу: {decision.group_id}.")
+            group_id = decision.group_id
+        else:
+            group_id = self._create_group(decision)
+
+        self._store.add_comment(SimpleStoredComment(
+            comment_id=row["comment_id"],
+            source=row["source"],
+            raw_text=row["raw_text"],
+            processed_text=row["processed_text"],
+            embedding=embedding,
+            group_id=group_id,
         ))
 
-    async def _build_embedding(self, text: str) -> list[float] | None:
-        """Генерирует векторное представление текста с ограничением параллелизма."""
-        try:
-            async with self._emb_sem:
-                return list(await self._embeddings.aembed_query(text))
-        except Exception as exc:
-            logger.error("Генерация эмбеддинга завершилась с ошибкой: %s", exc)
-            return None
+    def _create_group(self, decision: SimpleGroupDecision) -> str:
+        """Создает новую группу и возвращает ее идентификатор.
 
-    def _build_candidates(self, hits: list[SimilarityHit]) -> list[CandidateGroup]:
-        """Группирует hits по group_id, берёт максимальный score каждой группы."""
-        scores: dict[str, float] = {}
-        hit_ids: dict[str, list[str]] = {}
-        for hit in hits:
-            scores[hit.group_id] = max(scores.get(hit.group_id, float("-inf")), hit.similarity)
-            hit_ids.setdefault(hit.group_id, []).append(hit.comment_id)
+        Args:
+            decision: Решение LLM с возможным названием новой группы.
 
-        return [
-            CandidateGroup(
-                group_id=gid,
-                best_similarity=scores[gid],
-                representative_comment_ids=list(dict.fromkeys(hit_ids[gid])),
-            )
-            for gid in sorted(scores, key=lambda g: scores[g], reverse=True)
-        ]
+        Returns:
+            Идентификатор созданной группы.
 
-    def _fallback_decision(self, normalized_text: str, candidates: list[CandidateGroup]) -> PrimaryDecision:
-        """Детерминированное решение о группе без LLM: точное совпадение, порог или новая группа."""
-        if not candidates:
-            return PrimaryDecision(
-                decision_type=DecisionType.NEW_GROUP, group_id="",
-                reason="Подходящая существующая группа не найдена среди уже обработанных комментариев",
-            )
-        key = normalize_for_match(normalized_text)
-        best = candidates[0]
-        reps = [self._store.get_comment(cid) for cid in best.representative_comment_ids]
+        Raises:
+            ValueError: Если LLM не вернула название новой группы.
+        """
+        if not decision.group_name:
+            raise ValueError("Для новой группы LLM должна вернуть непустое поле group_name.")
+        group = self._store.create_group(decision.group_name)
+        return group.group_id
 
-        if any(normalize_for_match(c.normalized_text) == key for c in reps):
-            return PrimaryDecision(
-                decision_type=DecisionType.EXISTING_GROUP, group_id=best.group_id,
-                reason="Есть точное совпадение с уже обработанным комментарием этой группы",
-            )
-        if best.best_similarity >= self._threshold:
-            return PrimaryDecision(
-                decision_type=DecisionType.EXISTING_GROUP, group_id=best.group_id,
-                reason="Лучший кандидат достаточно близок по retrieval similarity",
-            )
-        return PrimaryDecision(
-            decision_type=DecisionType.NEW_GROUP, group_id="",
-            reason="Похожие комментарии есть, но уверенного совпадения с существующей группой нет",
-        )
+    def _format_candidates(self, candidates: list[SimpleCandidateGroup]) -> str:
+        """Форматирует группы-кандидаты для LLM prompt-а.
 
-    async def _generate_group_names(self, groups: list[CommentGroup]) -> None:
-        """Параллельно генерирует имена для всех групп."""
-        completed = 0
-        total = len(groups)
-        step = max(1, total // 10)
-        lock = asyncio.Lock()
+        Args:
+            candidates: Список групп-кандидатов из FAISS и BM25.
 
-        async def name_one(group: CommentGroup) -> None:
-            nonlocal completed
-            reps = self._store.unique_group_comments(group.group_id)
-            group.group_name = await self._name_generator.agenerate_name(
-                examples_text=self._format_examples(reps),
-                fallback_name=truncate_text(reps[0].normalized_text or reps[0].raw_text, 80) if reps else "Не определено",
-            )
-            async with lock:
-                completed += 1
-                if completed == 1 or completed == total or completed % step == 0:
-                    self._print("Нейминг групп", completed, total)
-
-        await asyncio.gather(*(name_one(g) for g in groups))
-
-    def _format_candidates(self, candidates: list[CandidateGroup]) -> str:
-        """Форматирует кандидатные группы в текст для промпта LLM."""
+        Returns:
+            Текстовое описание кандидатов с примерами комментариев.
+        """
         if not candidates:
             return "Кандидатных групп нет."
+
         lines: list[str] = []
-        for c in candidates:
-            lines.append(f"group_id: {c.group_id} | best_similarity: {c.best_similarity:.3f}")
-            for i, cid in enumerate(c.representative_comment_ids, start=1):
-                rep = self._store.get_comment(cid)
-                lines.append(f"  пример_{i}: raw_text={truncate_text(rep.raw_text)} | normalized_text={truncate_text(rep.normalized_text)}")
+        for candidate in candidates:
+            lines.append(
+                f"group_id: {candidate.group_id} | "
+                f"group_name: {truncate_text(candidate.group_name, 120)} | "
+                f"retrieval_score: {candidate.score:.3f}"
+            )
+            for index, comment_id in enumerate(candidate.representative_comment_ids, start=1):
+                comment = self._store.get_comment(comment_id)
+                lines.append(f"  пример_{index}: {truncate_text(comment.raw_text)}")
             lines.append("")
         return "\n".join(lines).strip()
 
-    @staticmethod
-    def _format_examples(comments: list[StoredComment]) -> str:
-        """Форматирует примеры комментариев группы для промпта нейминга."""
-        if not comments:
-            return "Примеров нет."
-        return "\n".join(
-            f"- comment_id: {c.comment_id} | raw_text: {truncate_text(c.raw_text)} | normalized_text: {truncate_text(c.normalized_text)}"
-            for c in comments
-        )
+    def _print(self, stage: str, current: int, total: int) -> None:
+        """Печатает прогресс текущего этапа.
 
-    @staticmethod
-    def _print(stage: str, current: int, total: int) -> None:
-        """Выводит строку прогресса для текущего этапа пайплайна."""
-        print(f"\r{stage}: {render_progress_bar(current, total)}".ljust(80))
+        Args:
+            stage: Название этапа обработки.
+            current: Количество обработанных элементов.
+            total: Общее количество элементов.
+
+        Returns:
+            ``None``.
+        """
+        if self._show_progress:
+            print(f"\r{stage}: {render_progress_bar(current, total)}".ljust(80))

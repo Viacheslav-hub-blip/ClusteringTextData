@@ -2,26 +2,20 @@
 
 Файл содержит публичные импорты:
 - ``PrimaryPromptConfig``;
-- ``AgenticPromptConfig``;
-- ``ClusteringPromptConfig``;
+- ``SimpleFaissBM25LLMClusteringPipeline``;
 - ``VectorLLMClusteringPipeline``;
-- ``VectorLLMAgenticClusteringPipeline``.
 """
 
 from __future__ import annotations
 
 from src import (
-    AgenticPromptConfig,
-    ClusteringPromptConfig,
     PrimaryPromptConfig,
-    VectorLLMAgenticClusteringPipeline,
+    SimpleFaissBM25LLMClusteringPipeline,
     VectorLLMClusteringPipeline,
 )
 
 __all__ = [
-    "AgenticPromptConfig",
-    "ClusteringPromptConfig",
     "PrimaryPromptConfig",
-    "VectorLLMAgenticClusteringPipeline",
+    "SimpleFaissBM25LLMClusteringPipeline",
     "VectorLLMClusteringPipeline",
 ]

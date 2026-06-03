@@ -4,8 +4,7 @@
 - ``build_llm`` — точка подключения пользовательской LLM-модели;
 - ``build_embeddings`` — точка подключения пользовательской embedding-модели;
 - ``load_comments`` — загрузка комментариев из JSON-файла или demo-списка;
-- ``run_vector_llm_example`` — запуск базового pipeline;
-- ``run_agentic_example`` — запуск полного pipeline с постобработкой;
+- ``run_vector_llm_example`` — запуск pipeline через FAISS, BM25 и LLM;
 - ``main`` — точка входа для запуска из IDE или файла.
 """
 
@@ -19,9 +18,7 @@ from langchain_core.embeddings import Embeddings
 from langchain_core.language_models import BaseChatModel
 
 from clusteringtextdata import (
-    ClusteringPromptConfig,
     PrimaryPromptConfig,
-    VectorLLMAgenticClusteringPipeline,
     VectorLLMClusteringPipeline,
 )
 
@@ -33,7 +30,6 @@ DEMO_COMMENTS: list[dict[str, str]] = [
     {"comment_id": "4", "text": "Постоянные блокировки карт мешают оплате"},
 ]
 
-RUN_MODE = "vector"
 INPUT_PATH: str | None = None
 OUTPUT_PATH: str | None = None
 
@@ -96,13 +92,13 @@ def load_comments(input_path: str | None) -> list[dict[str, Any]]:
 
 
 def run_vector_llm_example(comments: list[dict[str, Any]]) -> dict[str, Any]:
-    """Запускает базовый pipeline кластеризации.
+    """Запускает pipeline кластеризации через FAISS, BM25 и LLM.
 
     Args:
         comments: Список комментариев для обработки.
 
     Returns:
-        Результат базовой кластеризации.
+        Результат кластеризации со строками ``rows`` и описанием групп ``groups``.
     """
     llm = build_llm()
     embeddings = build_embeddings()
@@ -111,40 +107,11 @@ def run_vector_llm_example(comments: list[dict[str, Any]]) -> dict[str, Any]:
     pipeline = VectorLLMClusteringPipeline(
         llm=llm,
         embeddings=embeddings,
-        retrieval_top_k=12,
+        faiss_top_k=20,
+        bm25_top_k=20,
+        candidate_group_limit=7,
         max_examples_per_candidate_group=3,
-        primary_similarity_threshold=0.5,
         prompt_config=prompt_config,
-    )
-    return pipeline.run(comments)
-
-
-def run_agentic_example(comments: list[dict[str, Any]]) -> dict[str, Any]:
-    """Запускает полный pipeline с агентской постобработкой.
-
-    Args:
-        comments: Список комментариев для обработки.
-
-    Returns:
-        Финальный результат кластеризации после постобработки.
-    """
-    llm = build_llm()
-    embeddings = build_embeddings()
-
-    pipeline = VectorLLMAgenticClusteringPipeline(
-        llm=llm,
-        embeddings=embeddings,
-        prompt_config=ClusteringPromptConfig(),
-        primary_kwargs={
-            "retrieval_top_k": 12,
-            "max_examples_per_candidate_group": 3,
-            "primary_similarity_threshold": 0.5,
-        },
-        agentic_kwargs={
-            "max_rounds": 100,
-            "candidate_cluster_limit": 40,
-            "merge_groups_by_final_name": True,
-        },
     )
     return pipeline.run(comments)
 
@@ -158,16 +125,8 @@ def main() -> None:
     Returns:
         ``None``. Функция печатает результат и при необходимости сохраняет его в JSON.
     """
-    mode = RUN_MODE.strip().lower()
-    if mode not in {"vector", "agentic"}:
-        raise ValueError("RUN_MODE должен быть равен 'vector' или 'agentic'.")
-
     comments = load_comments(INPUT_PATH)
-
-    if mode == "vector":
-        result = run_vector_llm_example(comments)
-    else:
-        result = run_agentic_example(comments)
+    result = run_vector_llm_example(comments)
 
     output_text = json.dumps(result, ensure_ascii=False, indent=2)
     print(output_text)

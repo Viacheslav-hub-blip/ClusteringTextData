@@ -1,81 +1,33 @@
 # clusteringtextdata
 
-Библиотека для кластеризации текстовых комментариев через векторный поиск и LLM.
+Библиотека для кластеризации текстовых комментариев через минимальную предобработку, embeddings, FAISS, BM25 и LLM.
 
-В проекте есть два публичных pipeline:
+Текущая рабочая версия не использует agentic-постобработку, LLM-нормализацию, проверку пустых комментариев, автоматическое слияние групп по имени и резервное присвоение по similarity. FAISS и BM25 используются только для поиска групп-кандидатов, финальное решение принимает LLM.
 
-- `VectorLLMClusteringPipeline` — базовая кластеризация: нормализация комментариев, embedding, поиск похожих комментариев через FAISS/BM25, LLM-решение о группе, именование групп.
-- `VectorLLMAgenticClusteringPipeline` — полный pipeline: базовая кластеризация плюс агентская LLM-постобработка через LangGraph.
+У каждой входной записи в успешном результате всегда есть группа. Если запись не подходит ни к одной существующей группе, LLM должна вернуть `new_group` и `group_name`, включая случай одиночной группы.
 
-Библиотека не создает LLM-клиент сама и не читает API-ключи. Вы передаете готовые LangChain-объекты `llm` и `embeddings` снаружи.
+## Схема работы
 
-## Установка
-
-Из корня проекта:
-
-```bash
-pip install -e .
+```text
+исходные строки
+  -> минимальная предобработка текста
+  -> embeddings
+  -> FAISS top_k
+  -> BM25 top_k
+  -> объединение найденных групп-кандидатов
+  -> LLM выбирает existing_group или new_group
+  -> результат: все исходные поля + group_name
 ```
 
-или через `uv`:
+Минимальная предобработка:
 
-```bash
-uv pip install -e .
-```
+- приведение к нижнему регистру;
+- замена `ё` на `е`;
+- схлопывание пробелов;
+- схлопывание повторяющейся пунктуации: `!!! -> !`, `??? -> ?`, `... -> .`;
+- замена типографских кавычек и тире на простые символы.
 
-## Входные данные
-
-Базовый вход — список словарей:
-
-```python
-comments = [
-    {"comment_id": "1", "text": "Не могу подтвердить перевод"},
-    {"comment_id": "2", "text": "Долго приходит код подтверждения"},
-]
-```
-
-Обязательные поля:
-
-- `text` — исходный текст комментария.
-- `comment_id` — идентификатор комментария. Если поле пустое, pipeline подставит порядковый номер.
-
-## Схема работы pipeline
-
-```mermaid
-flowchart TD
-    A["Входные комментарии"] --> B["Валидация входа"]
-    B --> C["Нормализация комментариев через LLM"]
-    C --> D["Построение embeddings"]
-    D --> E["Hybrid retrieval: FAISS + BM25"]
-    E --> F["Выбор группы через LLM или fallback-логику"]
-    F --> G["Сохранение комментария в memory store"]
-    G --> H["Именование групп через LLM"]
-    H --> I["Слияние групп с одинаковыми именами"]
-    I --> J["Результат базового pipeline"]
-```
-
-Для `VectorLLMClusteringPipeline` выполнение заканчивается на этом этапе.
-
-```mermaid
-flowchart TD
-    A["Входные комментарии"] --> B["Базовый pipeline"]
-    B --> C["Первичные группы comments/groups"]
-    C --> D["AgenticPostProcessingPipeline"]
-    D --> E["Supervisor LangGraph"]
-    E --> F["Аудит неоднородных групп"]
-    E --> G["Маршрутизация unassigned-комментариев"]
-    E --> H["Проверка безопасного объединения групп"]
-    F --> I["Обновление состояния кластеров"]
-    G --> I
-    H --> I
-    I --> E
-    E --> J["Финальное именование групп"]
-    J --> K["Финальный результат"]
-```
-
-Для `VectorLLMAgenticClusteringPipeline` базовая кластеризация выступает первым этапом, после которого запускается агентская постобработка.
-
-## Базовая кластеризация
+## Использование
 
 ```python
 from clusteringtextdata import VectorLLMClusteringPipeline
@@ -83,178 +35,96 @@ from clusteringtextdata import VectorLLMClusteringPipeline
 pipeline = VectorLLMClusteringPipeline(
     llm=llm,
     embeddings=embeddings,
-    retrieval_top_k=12,
+    text_field="text",
+    faiss_top_k=20,
+    bm25_top_k=20,
+    candidate_group_limit=7,
     max_examples_per_candidate_group=3,
-    primary_similarity_threshold=0.5,
+    max_llm_retries=1,
+    max_embedding_retries=1,
 )
 
-result = pipeline.run(comments)
+result = pipeline.run(rows)
 ```
 
-Асинхронный запуск:
+`rows` — список словарей. Все исходные поля сохраняются:
 
 ```python
-result = await pipeline.arun(comments)
+rows = [
+    {"comment_id": "1", "text": "Не приходит код подтверждения", "source": "app"},
+    {"comment_id": "2", "text": "Долго жду код для перевода", "source": "web"},
+]
 ```
 
 Результат:
 
 ```python
 {
-    "comments": [
+    "rows": [
         {
             "comment_id": "1",
-            "raw_text": "...",
-            "normalized_text": "...",
-            "embedding": [...],
-            "group_id": "group_0001",
-            "decision_type": "new_group",
-            "decision_reason": "...",
+            "text": "Не приходит код подтверждения",
+            "source": "app",
+            "group_name": "Проблемы с кодом подтверждения",
         }
     ],
     "groups": [
-        {"group_id": "group_0001", "group_name": "..."}
+        {
+            "group_id": "group_0001",
+            "group_name": "Проблемы с кодом подтверждения",
+            "comment_count": 2,
+        }
     ],
 }
 ```
 
-## Полный pipeline с агентской постобработкой
+## Jupyter Notebook
+
+В ноутбуке можно использовать синхронный метод:
 
 ```python
-from clusteringtextdata import VectorLLMAgenticClusteringPipeline
-
-pipeline = VectorLLMAgenticClusteringPipeline(
-    llm=llm,
-    embeddings=embeddings,
-    primary_kwargs={
-        "retrieval_top_k": 12,
-        "primary_similarity_threshold": 0.5,
-    },
-    agentic_kwargs={
-        "max_rounds": 100,
-        "candidate_cluster_limit": 40,
-        "merge_groups_by_final_name": True,
-    },
-)
-
-result = pipeline.run(comments)
+result = pipeline.run(rows)
 ```
 
-Этот вариант сначала строит первичные группы, затем запускает supervisor-граф. Агентская постобработка может:
-
-- проверять неоднородные группы;
-- снимать неверные комментарии с группы;
-- заново маршрутизировать комментарии без группы;
-- проверять безопасное объединение групп;
-- переименовывать финальные группы.
-
-## Настройка prompt-ов
-
-Prompt-ы вынесены в конфигурацию. Это позволяет менять поведение кластеризации без изменения кода pipeline.
-
-### Базовые prompt-ы
+Метод безопасно работает в окружении с уже запущенным event loop. Если удобнее использовать async-стиль:
 
 ```python
-from clusteringtextdata import PrimaryPromptConfig, VectorLLMClusteringPipeline
-
-prompts = PrimaryPromptConfig.default()
-prompts.primary_decision_system = prompts.primary_decision_system + (
-    "\nДополнительное правило: не объединяй комментарии про разные каналы обслуживания."
-)
-
-pipeline = VectorLLMClusteringPipeline(
-    llm=llm,
-    embeddings=embeddings,
-    prompt_config=prompts,
-)
+result = await pipeline.arun(rows)
 ```
 
-Поля `PrimaryPromptConfig`:
-
-- `normalization_system` — system prompt нормализации.
-- `normalization_human` — human prompt нормализации. Должен содержать переменную `{text}`.
-- `primary_decision_system` — system prompt выбора группы.
-- `primary_decision_human` — human prompt выбора группы. Должен содержать `{raw_text}`, `{normalized_text}`, `{candidate_groups}`.
-- `group_naming_system` — system prompt именования группы.
-- `group_naming_human` — human prompt именования группы. Должен содержать `{group_examples}`.
-
-### Prompt-ы полного pipeline
+## DataFrame и Excel
 
 ```python
-from clusteringtextdata import (
-    AgenticPromptConfig,
-    ClusteringPromptConfig,
-    PrimaryPromptConfig,
-    VectorLLMAgenticClusteringPipeline,
-)
-
-prompt_config = ClusteringPromptConfig(
-    primary=PrimaryPromptConfig.default(),
-    agentic=AgenticPromptConfig(
-        supervisor_system="Твой system prompt supervisor-а...",
-        merge_groups_system="Твой system prompt проверки объединения...",
-    ),
-)
-
-pipeline = VectorLLMAgenticClusteringPipeline(
-    llm=llm,
-    embeddings=embeddings,
-    prompt_config=prompt_config,
-)
+df = pipeline.to_dataframe(result)
+pipeline.save_excel(result, "clusters.xlsx")
 ```
 
-Поля `AgenticPromptConfig` можно заполнять частично. Если поле равно `None`, используется дефолтный prompt из библиотеки.
+`to_dataframe` требует установленный `pandas`. Сохранение Excel использует `openpyxl`.
 
-Поля `AgenticPromptConfig`:
+## Формат ответа LLM
 
-- `supervisor_system`, `supervisor_human` — выбор следующего агентского действия.
-- `route_unassigned_system`, `route_unassigned_human` — маршрутизация комментариев без группы.
-- `cluster_audit_system`, `cluster_audit_human` — аудит группы.
-- `group_naming_system`, `group_naming_human` — финальное именование группы.
-- `merge_groups_system`, `merge_groups_human` — проверка объединения двух групп.
+Дефолтный system prompt находится в `src/prompts.py`. `src/config.py` содержит только dataclass-конфигурацию и не хранит текст запросов. Все данные для LLM передаются через system prompt, human message в цепочке всегда пустой.
 
-## Параметры базового pipeline
+LLM должна возвращать только JSON без markdown:
 
-- `retrieval_top_k` — сколько похожих комментариев доставать из hybrid retrieval.
-- `max_examples_per_candidate_group` — максимум примеров из одной группы в prompt выбора группы.
-- `min_meaningful_length` — минимальная длина осмысленного текста после нормализации.
-- `primary_similarity_threshold` — порог fallback-решения для выбора существующей группы без LLM.
-- `max_concurrent_llm_requests` — лимит параллельных LLM-запросов.
-- `max_concurrent_embedding_requests` — лимит параллельных embedding-запросов.
-- `prompt_config` — экземпляр `PrimaryPromptConfig`.
+```json
+{
+  "decision_type": "existing_group",
+  "group_id": "group_0001",
+  "group_name": "",
+  "reason": "Комментарий описывает ту же проблему."
+}
+```
 
-## Параметры агентской постобработки
+Для новой группы:
 
-- `text_fields` — порядок полей, из которых берется текст комментария.
-- `comment_id_field` — поле идентификатора комментария.
-- `group_id_field` — поле идентификатора группы.
-- `group_name_field` — поле названия группы.
-- `new_group_prefix` — префикс новых групп.
-- `supervisor_group_limit` — максимум групп в snapshot supervisor-а.
-- `supervisor_examples_per_group` — количество примеров на группу в snapshot.
-- `supervisor_unassigned_limit` — максимум комментариев без группы в snapshot.
-- `max_examples_per_candidate_group` — максимум примеров на группу-кандидат при маршрутизации.
-- `route_batch_size` — сколько комментариев supervisor может отправить на маршрутизацию за шаг.
-- `audit_comment_limit` — сколько комментариев группы передается на аудит.
-- `merge_example_limit` — сколько примеров группы передается при проверке объединения.
-- `max_concurrent_llm_requests` — лимит параллельных LLM-запросов.
-- `candidate_cluster_limit` — максимум групп-кандидатов для маршрутизации.
-- `max_rounds` — максимум циклов supervisor -> action.
-- `max_no_change_rounds` — максимум подряд идущих шагов без изменений.
-- `max_audit_passes_per_group` — максимум аудитов одной группы.
-- `merge_groups_by_final_name` — включить проверку объединения групп с одинаковыми финальными именами.
-- `prompt_config` — экземпляр `AgenticPromptConfig`.
+```json
+{
+  "decision_type": "new_group",
+  "group_id": "",
+  "group_name": "Блокировка карты при оплате",
+  "reason": "Среди кандидатов нет группы с этой проблемой."
+}
+```
 
-## Структура результата
-
-`comments` содержит исходный текст, нормализованный текст, embedding, группу и причину решения.
-
-`groups` содержит идентификаторы групп и финальные названия.
-
-В полном pipeline дополнительно может быть служебная информация постобработки, которую формирует `AgenticPostProcessingPipeline`.
-
-## Ограничения
-
-- Библиотека ожидает совместимые LangChain-модели `BaseChatModel` и `Embeddings`.
-- Код не хранит ключи и не создает клиентов провайдеров.
-- Для больших датасетов важно настроить лимиты параллелизма и размеры prompt-ов.
+Если LLM вернула несуществующий `group_id`, невалидный `decision_type` или не указала `group_name` для новой группы, pipeline завершает работу с ошибкой. Если LLM-вызов или batch embedding-вызов не сработал после retry-попыток, pipeline также завершает работу с ошибкой.
