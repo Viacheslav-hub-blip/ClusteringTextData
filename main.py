@@ -107,10 +107,13 @@ def run_vector_llm_example(comments: list[dict[str, Any]]) -> dict[str, Any]:
     pipeline = VectorLLMClusteringPipeline(
         llm=llm,
         embeddings=embeddings,
-        faiss_top_k=20,
-        bm25_top_k=20,
-        candidate_group_limit=7,
-        max_examples_per_candidate_group=3,
+        faiss_top_k=50,
+        bm25_top_k=50,
+        candidate_group_limit=15,
+        max_examples_per_candidate_group=5,
+        merge_small_groups=True,
+        small_group_max_size=2,
+        merge_candidate_group_limit=20,
         prompt_config=prompt_config,
     )
     return pipeline.run(comments)

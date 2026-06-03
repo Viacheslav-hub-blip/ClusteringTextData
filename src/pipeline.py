@@ -319,6 +319,7 @@ class SimpleHybridMemoryStore:
             query_embedding: list[float],
             candidate_group_limit: int,
             max_examples_per_group: int,
+            exclude_group_ids: set[str] | None = None,
     ) -> list[SimpleCandidateGroup]:
         """Ищет группы-кандидаты через FAISS и BM25.
 
@@ -327,6 +328,7 @@ class SimpleHybridMemoryStore:
             query_embedding: Вектор текущего комментария.
             candidate_group_limit: Максимальное количество групп-кандидатов.
             max_examples_per_group: Максимальное количество примеров на одну группу.
+            exclude_group_ids: Идентификаторы групп, которые нужно исключить из выдачи.
 
         Returns:
             Список групп-кандидатов для LLM.
@@ -334,18 +336,22 @@ class SimpleHybridMemoryStore:
         if not self._ordered_ids:
             return []
 
-        ranked_comment_ids = self._search_faiss(query_embedding) + self._search_bm25(query_text)
+        excluded_groups = exclude_group_ids or set()
         group_scores: dict[str, float] = {}
         group_examples: dict[str, list[str]] = {}
 
-        for rank, (comment_id, source_weight) in enumerate(ranked_comment_ids, start=1):
-            comment = self._comments.get(comment_id)
-            if comment is None:
-                continue
-            group_scores[comment.group_id] = group_scores.get(comment.group_id, 0.0) + source_weight / rank
-            examples = group_examples.setdefault(comment.group_id, [])
-            if len(examples) < max_examples_per_group and comment_id not in examples:
-                examples.append(comment_id)
+        ranked_sources = (
+            self._search_faiss(query_embedding),
+            self._search_bm25(query_text),
+        )
+        for ranked_comment_ids in ranked_sources:
+            self._accumulate_candidate_scores(
+                ranked_comment_ids=ranked_comment_ids,
+                group_scores=group_scores,
+                group_examples=group_examples,
+                max_examples_per_group=max_examples_per_group,
+                exclude_group_ids=excluded_groups,
+            )
 
         candidates: list[SimpleCandidateGroup] = []
         for group_id in sorted(group_scores, key=group_scores.get, reverse=True)[:candidate_group_limit]:
@@ -357,6 +363,69 @@ class SimpleHybridMemoryStore:
                 representative_comment_ids=group_examples.get(group_id, [])[:max_examples_per_group],
             ))
         return candidates
+
+    def move_comments_to_group(self, *, comment_ids: list[str], target_group_id: str) -> None:
+        """Переносит комментарии из текущих групп в целевую группу.
+
+        Args:
+            comment_ids: Идентификаторы комментариев, которые нужно перенести.
+            target_group_id: Идентификатор группы, в которую нужно перенести комментарии.
+
+        Returns:
+            ``None``.
+
+        Raises:
+            ValueError: Если целевая группа не найдена.
+        """
+        if target_group_id not in self._groups:
+            raise ValueError(f"Целевая группа не найдена: {target_group_id}.")
+
+        source_group_ids: set[str] = set()
+        for comment_id in comment_ids:
+            comment = self._comments[comment_id]
+            if comment.group_id == target_group_id:
+                continue
+            source_group_ids.add(comment.group_id)
+            source_group = self._groups[comment.group_id]
+            if comment_id in source_group.member_comment_ids:
+                source_group.member_comment_ids.remove(comment_id)
+            comment.group_id = target_group_id
+            self._groups[target_group_id].member_comment_ids.append(comment_id)
+
+        for group_id in source_group_ids:
+            group = self._groups.get(group_id)
+            if group is not None and not group.member_comment_ids:
+                del self._groups[group_id]
+
+    def _accumulate_candidate_scores(
+            self,
+            *,
+            ranked_comment_ids: list[tuple[str, float]],
+            group_scores: dict[str, float],
+            group_examples: dict[str, list[str]],
+            max_examples_per_group: int,
+            exclude_group_ids: set[str],
+    ) -> None:
+        """Добавляет scores одного retrieval-источника в общий рейтинг групп.
+
+        Args:
+            ranked_comment_ids: Ранжированный список комментариев одного источника retrieval.
+            group_scores: Накопленные scores групп.
+            group_examples: Накопленные примеры комментариев по группам.
+            max_examples_per_group: Максимальное количество примеров на одну группу.
+            exclude_group_ids: Идентификаторы групп, исключенных из выдачи.
+
+        Returns:
+            ``None``.
+        """
+        for rank, (comment_id, source_weight) in enumerate(ranked_comment_ids, start=1):
+            comment = self._comments.get(comment_id)
+            if comment is None or comment.group_id in exclude_group_ids:
+                continue
+            group_scores[comment.group_id] = group_scores.get(comment.group_id, 0.0) + source_weight / rank
+            examples = group_examples.setdefault(comment.group_id, [])
+            if len(examples) < max_examples_per_group and comment_id not in examples:
+                examples.append(comment_id)
 
     def rows_with_group_name(self) -> list[dict[str, Any]]:
         """Собирает строки результата в формате исходные поля плюс ``group_name``.
@@ -620,6 +689,9 @@ class SimpleFaissBM25LLMClusteringPipeline:
         bm25_top_k: Количество ближайших комментариев из BM25.
         candidate_group_limit: Максимальное количество групп-кандидатов для LLM.
         max_examples_per_candidate_group: Максимальное количество примеров на группу-кандидат.
+        merge_small_groups: Если ``True``, запускает второй проход слияния маленьких групп.
+        small_group_max_size: Максимальный размер группы, которую можно рассматривать для слияния.
+        merge_candidate_group_limit: Максимальное количество групп-кандидатов для второго прохода.
         max_concurrent_llm_requests: Лимит параллельных LLM-запросов.
         max_llm_retries: Количество повторных попыток LLM-вызова после первой ошибки.
         max_embedding_retries: Количество повторных попыток batch embedding-вызова после первой ошибки.
@@ -636,10 +708,13 @@ class SimpleFaissBM25LLMClusteringPipeline:
             embeddings: Embeddings,
             *,
             text_field: str = "text",
-            faiss_top_k: int = 20,
-            bm25_top_k: int = 20,
-            candidate_group_limit: int = 7,
-            max_examples_per_candidate_group: int = 3,
+            faiss_top_k: int = 50,
+            bm25_top_k: int = 50,
+            candidate_group_limit: int = 15,
+            max_examples_per_candidate_group: int = 5,
+            merge_small_groups: bool = True,
+            small_group_max_size: int = 2,
+            merge_candidate_group_limit: int = 20,
             max_concurrent_llm_requests: int = 3,
             max_llm_retries: int = 1,
             max_embedding_retries: int = 1,
@@ -649,6 +724,9 @@ class SimpleFaissBM25LLMClusteringPipeline:
         self._text_field = text_field
         self._candidate_group_limit = candidate_group_limit
         self._max_examples = max_examples_per_candidate_group
+        self._merge_small_groups = merge_small_groups
+        self._small_group_max_size = max(1, small_group_max_size)
+        self._merge_candidate_group_limit = max(1, merge_candidate_group_limit)
         self._embeddings = embeddings
         self._llm_sem = asyncio.Semaphore(max_concurrent_llm_requests)
         self._max_embedding_retries = max(0, max_embedding_retries)
@@ -697,6 +775,11 @@ class SimpleFaissBM25LLMClusteringPipeline:
             await self._process_row(row=row, embedding=embedding)
             if index == 1 or index == total or index % step == 0:
                 self._print("Кластеризация", index, total)
+
+        if self._merge_small_groups:
+            self._print("Слияние маленьких групп", 0, total)
+            await self._merge_small_candidate_groups()
+            self._print("Слияние маленьких групп", total, total)
 
         self._print("Готово", total, total)
         return {
@@ -873,6 +956,102 @@ class SimpleFaissBM25LLMClusteringPipeline:
                 lines.append(f"  пример_{index}: {truncate_text(comment.raw_text)}")
             lines.append("")
         return "\n".join(lines).strip()
+
+    async def _merge_small_candidate_groups(self) -> None:
+        """Запускает второй проход слияния маленьких групп с похожими кандидатами.
+
+        Args:
+            Входные аргументы отсутствуют.
+
+        Returns:
+            ``None``. Комментарии маленьких групп переносятся в существующие группы,
+            если LLM подтверждает совпадение основного смысла.
+        """
+        group_ids = [group.group_id for group in self._store.all_groups()]
+        for group_id in group_ids:
+            group = self._store.get_group(group_id)
+            if group is None or len(group.member_comment_ids) > self._small_group_max_size:
+                continue
+
+            candidates = self._search_merge_candidates(group)
+            if not candidates:
+                continue
+
+            merge_text = self._format_group_for_merge(group)
+            decision = await self._decision_engine.achoose_group(
+                raw_text=merge_text,
+                processed_text=preprocess_text(merge_text),
+                candidate_groups_text=self._format_candidates(candidates),
+                candidate_group_ids={candidate.group_id for candidate in candidates},
+            )
+            if decision.decision_type != "existing_group":
+                continue
+
+            target_group = self._store.get_group(decision.group_id)
+            current_group = self._store.get_group(group_id)
+            if target_group is None or current_group is None or target_group.group_id == current_group.group_id:
+                continue
+            self._store.move_comments_to_group(
+                comment_ids=list(current_group.member_comment_ids),
+                target_group_id=target_group.group_id,
+            )
+
+    def _search_merge_candidates(self, group: SimpleCommentGroup) -> list[SimpleCandidateGroup]:
+        """Ищет группы-кандидаты для слияния маленькой группы.
+
+        Args:
+            group: Маленькая группа, которую нужно проверить на возможное слияние.
+
+        Returns:
+            Список групп-кандидатов, отсортированных по объединенному retrieval-score.
+        """
+        candidates_by_group_id: dict[str, SimpleCandidateGroup] = {}
+        for comment_id in group.member_comment_ids:
+            comment = self._store.get_comment(comment_id)
+            candidates = self._store.search_candidates(
+                query_text=f"{group.group_name} {comment.processed_text}",
+                query_embedding=comment.embedding,
+                candidate_group_limit=self._merge_candidate_group_limit,
+                max_examples_per_group=self._max_examples,
+                exclude_group_ids={group.group_id},
+            )
+            for candidate in candidates:
+                existing = candidates_by_group_id.get(candidate.group_id)
+                if existing is None:
+                    candidates_by_group_id[candidate.group_id] = candidate
+                    continue
+                existing.score += candidate.score
+                for representative_id in candidate.representative_comment_ids:
+                    if (
+                            representative_id not in existing.representative_comment_ids
+                            and len(existing.representative_comment_ids) < self._max_examples
+                    ):
+                        existing.representative_comment_ids.append(representative_id)
+
+        return sorted(
+            candidates_by_group_id.values(),
+            key=lambda candidate: candidate.score,
+            reverse=True,
+        )[:self._merge_candidate_group_limit]
+
+    def _format_group_for_merge(self, group: SimpleCommentGroup) -> str:
+        """Форматирует маленькую группу как текущий объект для LLM-сравнения.
+
+        Args:
+            group: Маленькая группа, которую нужно проверить на слияние.
+
+        Returns:
+            Текстовое описание группы с названием и примерами комментариев.
+        """
+        lines = [
+            "Проверь, нужно ли присоединить эту маленькую группу к одной из групп-кандидатов.",
+            f"Название маленькой группы: {truncate_text(group.group_name, 180)}",
+            "Комментарии маленькой группы:",
+        ]
+        for index, comment_id in enumerate(group.member_comment_ids, start=1):
+            comment = self._store.get_comment(comment_id)
+            lines.append(f"пример_{index}: {truncate_text(comment.raw_text)}")
+        return "\n".join(lines)
 
     def _print(self, stage: str, current: int, total: int) -> None:
         """Печатает прогресс текущего этапа.
