@@ -1,34 +1,78 @@
 # clusteringtextdata
 
-Библиотека для кластеризации текстовых комментариев через минимальную предобработку, embeddings, FAISS, BM25 и LLM.
+Библиотека для простой кластеризации текстовых комментариев через embeddings, FAISS/BM25 и LLM.
 
-Текущая рабочая версия не использует agentic-постобработку, LLM-нормализацию, проверку пустых комментариев и резервное присвоение по similarity. FAISS и BM25 используются для поиска групп-кандидатов, финальное решение принимает LLM. После основного прохода pipeline может выполнить дополнительное LLM-слияние маленьких групп с похожими существующими группами.
+Текущая версия убирает дорогие лишние этапы:
 
-У каждой входной записи в успешном результате всегда есть группа. Если запись не подходит ни к одной существующей группе, LLM должна вернуть `new_group` и `group_name`, включая случай одиночной группы.
+- нет LLM-нормализации каждого комментария;
+- нет agentic-постобработки;
+- нет обязательного слияния групп после нейминга;
+- есть один простой вызов для Jupyter Notebook, IDE, CSV/XLSX и pandas DataFrame.
 
-## Схема работы
+Библиотека не создает LLM-клиент и не читает API-ключи. Вы передаете готовые LangChain-объекты `llm` и `embeddings` снаружи.
 
-```text
-исходные строки
-  -> минимальная предобработка текста
-  -> embeddings
-  -> FAISS top_k
-  -> BM25 top_k
-  -> объединение найденных групп-кандидатов
-  -> LLM выбирает existing_group или new_group
-  -> второй проход: LLM проверяет слияние маленьких групп
-  -> результат: все исходные поля + group_name
+## Быстрый запуск в Jupyter
+
+```python
+from clusteringtextdata import cluster_text_data
+
+result_df = cluster_text_data(
+    "comments.xlsx",
+    llm=llm,
+    embeddings=embeddings,
+    text_column="text",
+    output_path="clusters.xlsx",
+)
 ```
 
-Минимальная предобработка:
+Если данные уже в pandas DataFrame:
 
-- приведение к нижнему регистру;
-- замена `ё` на `е`;
-- схлопывание пробелов;
-- схлопывание повторяющейся пунктуации: `!!! -> !`, `??? -> ?`, `... -> .`;
-- замена типографских кавычек и тире на простые символы.
+```python
+result_df = cluster_text_data(
+    df,
+    llm=llm,
+    embeddings=embeddings,
+    text_column="comment",
+    id_column="id",
+)
+```
 
-## Использование
+Для ускорения можно отключить LLM-нейминг групп. Тогда названием группы будет первый характерный комментарий:
+
+```python
+result_df = cluster_text_data(
+    df,
+    llm=llm,
+    embeddings=embeddings,
+    text_column="comment",
+    generate_group_names=False,
+)
+```
+
+## Что делает pipeline
+
+1. Читает строки из DataFrame, списка словарей, CSV или XLSX.
+2. Берет текст из `text_column`.
+3. Делает только техническую очистку текста: пробелы, типографские кавычки, тире.
+4. Строит embeddings для комментариев.
+5. Обрабатывает комментарии последовательно.
+6. Для каждого нового комментария ищет похожие уже обработанные комментарии через FAISS и BM25.
+7. Передает LLM только текущий комментарий и несколько групп-кандидатов.
+8. LLM выбирает `existing_group` или `new_group`.
+9. В конце опционально генерирует короткие названия групп.
+10. Возвращает исходные строки с добавленным `group_name`.
+
+## Основные параметры
+
+- `text_column` — колонка с текстом комментария.
+- `id_column` — колонка с ID. Если не указана, используется `comment_id` или номер строки.
+- `output_path` — путь для сохранения результата в `.xlsx` или `.csv`.
+- `generate_group_names=True` — включить LLM-нейминг групп.
+- `generate_group_names=False` — быстрее, без дополнительного LLM-вызова на каждую группу.
+- `merge_same_name_groups=False` — по умолчанию группы не склеиваются после нейминга.
+- `show_progress=False` — по умолчанию без консольного прогресса, удобно для notebook.
+
+## Использование класса напрямую
 
 ```python
 from clusteringtextdata import VectorLLMClusteringPipeline
@@ -36,123 +80,33 @@ from clusteringtextdata import VectorLLMClusteringPipeline
 pipeline = VectorLLMClusteringPipeline(
     llm=llm,
     embeddings=embeddings,
-    text_field="text",
-    faiss_top_k=80,
-    bm25_top_k=80,
-    candidate_group_limit=30,
-    max_examples_per_candidate_group=8,
-    merge_small_groups=True,
-    small_group_max_size=5,
-    merge_candidate_group_limit=40,
-    facet_candidate_weight=1.2,
-    auto_assign_min_score=1.65,
-    auto_assign_min_facet_score=0.72,
-    auto_assign_min_gap=0.25,
-    max_llm_retries=1,
-    max_embedding_retries=1,
+    retrieval_top_k=12,
+    max_examples_per_candidate_group=3,
+    primary_similarity_threshold=0.5,
 )
 
-result = pipeline.run(rows)
+result = pipeline.run([
+    {"comment_id": "1", "text": "Не приходит код подтверждения перевода"},
+    {"comment_id": "2", "text": "Долго приходит СМС для подтверждения"},
+])
 ```
 
-`rows` — список словарей. Все исходные поля сохраняются:
+В Jupyter можно использовать обычный синхронный `run`, но для async-окружений также доступен:
 
 ```python
-rows = [
-    {"comment_id": "1", "text": "Не приходит код подтверждения", "source": "app"},
-    {"comment_id": "2", "text": "Долго жду код для перевода", "source": "web"},
-]
+result = await pipeline.arun(comments)
 ```
 
-Результат:
+## Формат результата
 
-```python
-{
-    "rows": [
-        {
-            "comment_id": "1",
-            "text": "Не приходит код подтверждения",
-            "source": "app",
-            "group_name": "Проблемы с кодом подтверждения",
-        }
-    ],
-    "groups": [
-        {
-            "group_id": "group_0001",
-            "group_name": "Проблемы с кодом подтверждения",
-            "comment_count": 2,
-        }
-    ],
-}
-```
+`cluster_text_data` возвращает pandas DataFrame, если pandas установлен. Если pandas недоступен, возвращается список словарей.
 
-## Jupyter Notebook
+В результат добавляется поле:
 
-В ноутбуке можно использовать синхронный метод:
+- `group_name` — название найденной группы.
 
-```python
-result = pipeline.run(rows)
-```
+Если передать `include_details=True`, дополнительно добавятся:
 
-Метод безопасно работает в окружении с уже запущенным event loop. Если удобнее использовать async-стиль:
-
-```python
-result = await pipeline.arun(rows)
-```
-
-## DataFrame и Excel
-
-```python
-df = pipeline.to_dataframe(result)
-pipeline.save_excel(result, "clusters.xlsx")
-```
-
-`to_dataframe` требует установленный `pandas`. Сохранение Excel использует `openpyxl`.
-
-## Формат ответа LLM
-
-Дефолтный system prompt находится в `src/prompts.py`. `src/config.py` содержит только dataclass-конфигурацию и не хранит текст запросов. Все данные для LLM передаются через system prompt, human message в цепочке всегда пустой.
-
-LLM должна возвращать только JSON без markdown:
-
-```json
-{
-  "decision_type": "existing_group",
-  "group_id": "group_0001",
-  "group_name": "",
-  "reason": "Комментарий описывает ту же проблему."
-}
-```
-
-Для новой группы:
-
-```json
-{
-  "decision_type": "new_group",
-  "group_id": "",
-  "group_name": "Блокировка карты при оплате",
-  "reason": "Среди кандидатов нет группы с этой проблемой."
-}
-```
-
-Если LLM вернула несуществующий `group_id`, невалидный `decision_type` или не указала `group_name` для новой группы, pipeline завершает работу с ошибкой. Если LLM-вызов или batch embedding-вызов не сработал после retry-попыток, pipeline также завершает работу с ошибкой.
-
-## Слияние маленьких групп
-
-По умолчанию после первичной кластеризации pipeline проверяет группы размером до `small_group_max_size=5`. Для каждой такой группы он ищет похожие существующие группы через FAISS, BM25 и фасетный профиль. Если совпадение уверенное, группа присоединяется автоматически без LLM. Если совпадение спорное, pipeline отправляет LLM отдельное решение: оставить группу отдельной или присоединить ее к одному из кандидатов.
-
-## Фасетный скоринг
-
-Перед выбором группы pipeline извлекает из комментариев фасеты: тип операции, продукт или услугу, торговую точку, компанию, место, время, город, канал и тип проблемы. Эти признаки не образуют жесткую иерархию, а используются как взвешенный сигнал в общем рейтинге кандидатов. Уверенные совпадения назначаются автоматически без LLM, что сокращает количество LLM-вызовов.
-
-В итоговом результате возвращается блок `stats` со счетчиками `llm_decisions`, `auto_assignments`, `merge_llm_decisions` и `merge_auto_assignments`.
-
-Чтобы отключить второй проход:
-
-```python
-pipeline = VectorLLMClusteringPipeline(
-    llm=llm,
-    embeddings=embeddings,
-    merge_small_groups=False,
-)
-```
+- `normalized_text`;
+- `decision_type`;
+- `decision_reason`.

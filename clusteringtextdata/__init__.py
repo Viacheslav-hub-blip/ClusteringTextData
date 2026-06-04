@@ -2,26 +2,20 @@
 
 Файл содержит публичные импорты:
 - ``PrimaryPromptConfig``;
-- ``CommentFacets``;
-- ``extract_facets``;
-- ``SimpleFaissBM25LLMClusteringPipeline``;
 - ``VectorLLMClusteringPipeline``;
+- ``cluster_text_data``.
 """
 
 from __future__ import annotations
 
 from src import (
-    CommentFacets,
     PrimaryPromptConfig,
-    SimpleFaissBM25LLMClusteringPipeline,
     VectorLLMClusteringPipeline,
-    extract_facets,
+    cluster_text_data,
 )
 
 __all__ = [
     "PrimaryPromptConfig",
-    "CommentFacets",
-    "extract_facets",
-    "SimpleFaissBM25LLMClusteringPipeline",
     "VectorLLMClusteringPipeline",
+    "cluster_text_data",
 ]
