@@ -37,13 +37,13 @@ pipeline = VectorLLMClusteringPipeline(
     llm=llm,
     embeddings=embeddings,
     text_field="text",
-    faiss_top_k=50,
-    bm25_top_k=50,
-    candidate_group_limit=15,
-    max_examples_per_candidate_group=5,
+    faiss_top_k=80,
+    bm25_top_k=80,
+    candidate_group_limit=30,
+    max_examples_per_candidate_group=8,
     merge_small_groups=True,
-    small_group_max_size=2,
-    merge_candidate_group_limit=20,
+    small_group_max_size=5,
+    merge_candidate_group_limit=40,
     max_llm_retries=1,
     max_embedding_retries=1,
 )
@@ -135,7 +135,7 @@ LLM должна возвращать только JSON без markdown:
 
 ## Слияние маленьких групп
 
-По умолчанию после первичной кластеризации pipeline проверяет группы размером до `small_group_max_size=2`. Для каждой такой группы он ищет похожие существующие группы через FAISS и BM25, затем отправляет LLM отдельное решение: оставить группу отдельной или присоединить ее к одному из кандидатов.
+По умолчанию после первичной кластеризации pipeline проверяет группы размером до `small_group_max_size=5`. Для каждой такой группы он ищет похожие существующие группы через FAISS и BM25, затем отправляет LLM отдельное решение: оставить группу отдельной или присоединить ее к одному из кандидатов.
 
 Чтобы отключить второй проход:
 
