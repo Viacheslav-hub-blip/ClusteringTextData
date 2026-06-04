@@ -114,6 +114,10 @@ def run_vector_llm_example(comments: list[dict[str, Any]]) -> dict[str, Any]:
         merge_small_groups=True,
         small_group_max_size=5,
         merge_candidate_group_limit=40,
+        facet_candidate_weight=1.2,
+        auto_assign_min_score=1.65,
+        auto_assign_min_facet_score=0.72,
+        auto_assign_min_gap=0.25,
         prompt_config=prompt_config,
     )
     return pipeline.run(comments)

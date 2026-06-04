@@ -325,6 +325,9 @@ PRIMARY_DECISION_SYSTEM = f"""
 - raw_text: {{raw_text}}
 - normalized_text: {{normalized_text}}
 
+Фасеты текущего комментария:
+{{facets}}
+
 Группы-кандидаты:
 {{candidate_groups}}
 </input>

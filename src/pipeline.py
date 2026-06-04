@@ -29,6 +29,14 @@ from langchain_core.prompts import ChatPromptTemplate
 from rank_bm25 import BM25Okapi
 
 from .config import PrimaryPromptConfig
+from .facets import (
+    CommentFacets,
+    DEFAULT_FACET_WEIGHTS,
+    extract_facets,
+    format_facet_profile,
+    score_facets_against_profile,
+    update_facet_profile,
+)
 from .prompts import EMPTY_HUMAN_MESSAGE
 
 logger = logging.getLogger(__name__)
@@ -150,6 +158,7 @@ class SimpleStoredComment:
         source: Исходная строка данных в виде словаря.
         raw_text: Исходный текст комментария.
         processed_text: Предобработанный текст комментария.
+        facets: Фасеты комментария для бизнес-ориентированного скоринга.
         embedding: Векторное представление комментария.
         group_id: Идентификатор назначенной группы.
 
@@ -161,6 +170,7 @@ class SimpleStoredComment:
     source: dict[str, Any]
     raw_text: str
     processed_text: str
+    facets: CommentFacets
     embedding: list[float]
     group_id: str
 
@@ -173,6 +183,7 @@ class SimpleCommentGroup:
         group_id: Внутренний идентификатор группы.
         group_name: Человекочитаемое название группы.
         member_comment_ids: Идентификаторы комментариев, входящих в группу.
+        facet_profile: Агрегированный профиль фасетов комментариев группы.
 
     Returns:
         Экземпляр группы комментариев.
@@ -181,6 +192,7 @@ class SimpleCommentGroup:
     group_id: str
     group_name: str
     member_comment_ids: list[str] = field(default_factory=list)
+    facet_profile: dict[str, dict[str, int]] = field(default_factory=dict)
 
 
 @dataclass(slots=True)
@@ -191,6 +203,7 @@ class SimpleCandidateGroup:
         group_id: Идентификатор группы-кандидата.
         group_name: Текущее название группы.
         score: Объединенный retrieval-score по FAISS и BM25.
+        facet_score: Похожесть фасетов текущего комментария и профиля группы.
         representative_comment_ids: Идентификаторы примеров из группы.
 
     Returns:
@@ -200,7 +213,50 @@ class SimpleCandidateGroup:
     group_id: str
     group_name: str
     score: float
+    facet_score: float
     representative_comment_ids: list[str]
+
+
+@dataclass(slots=True)
+class SimplePipelineStats:
+    """Счетчики выполнения pipeline для оценки скорости и доли LLM-решений.
+
+    Args:
+        processed_rows: Количество обработанных комментариев.
+        llm_decisions: Количество LLM-вызовов для первичной маршрутизации.
+        auto_assignments: Количество автоматических назначений без LLM.
+        merge_llm_decisions: Количество LLM-вызовов на втором проходе слияния.
+        merge_auto_assignments: Количество автоматических слияний маленьких групп.
+        created_groups: Количество созданных групп.
+
+    Returns:
+        Экземпляр со статистикой текущего запуска pipeline.
+    """
+
+    processed_rows: int = 0
+    llm_decisions: int = 0
+    auto_assignments: int = 0
+    merge_llm_decisions: int = 0
+    merge_auto_assignments: int = 0
+    created_groups: int = 0
+
+    def to_dict(self) -> dict[str, int]:
+        """Возвращает статистику pipeline как словарь.
+
+        Args:
+            Входные аргументы отсутствуют.
+
+        Returns:
+            Словарь с числовыми счетчиками выполнения.
+        """
+        return {
+            "processed_rows": self.processed_rows,
+            "llm_decisions": self.llm_decisions,
+            "auto_assignments": self.auto_assignments,
+            "merge_llm_decisions": self.merge_llm_decisions,
+            "merge_auto_assignments": self.merge_auto_assignments,
+            "created_groups": self.created_groups,
+        }
 
 
 @dataclass(slots=True)
@@ -235,10 +291,20 @@ class SimpleHybridMemoryStore:
         Экземпляр in-memory хранилища для одного запуска pipeline.
     """
 
-    def __init__(self, embeddings: Embeddings, *, bm25_top_k: int, faiss_top_k: int) -> None:
+    def __init__(
+            self,
+            embeddings: Embeddings,
+            *,
+            bm25_top_k: int,
+            faiss_top_k: int,
+            facet_weights: dict[str, float] | None = None,
+            facet_candidate_weight: float = 1.2,
+    ) -> None:
         self._embeddings = embeddings
         self._bm25_top_k = bm25_top_k
         self._faiss_top_k = faiss_top_k
+        self._facet_weights = facet_weights or DEFAULT_FACET_WEIGHTS
+        self._facet_candidate_weight = max(0.0, facet_candidate_weight)
         self._ordered_ids: list[str] = []
         self._comments: dict[str, SimpleStoredComment] = {}
         self._groups: dict[str, SimpleCommentGroup] = {}
@@ -274,7 +340,9 @@ class SimpleHybridMemoryStore:
         """
         self._ordered_ids.append(comment.comment_id)
         self._comments[comment.comment_id] = comment
-        self._groups[comment.group_id].member_comment_ids.append(comment.comment_id)
+        group = self._groups[comment.group_id]
+        group.member_comment_ids.append(comment.comment_id)
+        update_facet_profile(group.facet_profile, comment.facets)
         self._index_comment(comment)
         self._bm25_tokens.append(tokenize_for_bm25(comment.processed_text))
         self._bm25_dirty = True
@@ -317,6 +385,7 @@ class SimpleHybridMemoryStore:
             *,
             query_text: str,
             query_embedding: list[float],
+            query_facets: CommentFacets,
             candidate_group_limit: int,
             max_examples_per_group: int,
             exclude_group_ids: set[str] | None = None,
@@ -326,6 +395,7 @@ class SimpleHybridMemoryStore:
         Args:
             query_text: Предобработанный текст текущего комментария.
             query_embedding: Вектор текущего комментария.
+            query_facets: Фасеты текущего комментария для бизнес-ориентированного поиска.
             candidate_group_limit: Максимальное количество групп-кандидатов.
             max_examples_per_group: Максимальное количество примеров на одну группу.
             exclude_group_ids: Идентификаторы групп, которые нужно исключить из выдачи.
@@ -352,14 +422,25 @@ class SimpleHybridMemoryStore:
                 max_examples_per_group=max_examples_per_group,
                 exclude_group_ids=excluded_groups,
             )
+        self._accumulate_facet_scores(
+            query_facets=query_facets,
+            group_scores=group_scores,
+            exclude_group_ids=excluded_groups,
+        )
 
         candidates: list[SimpleCandidateGroup] = []
         for group_id in sorted(group_scores, key=group_scores.get, reverse=True)[:candidate_group_limit]:
             group = self._groups[group_id]
+            facet_score = score_facets_against_profile(
+                query_facets,
+                group.facet_profile,
+                weights=self._facet_weights,
+            )
             candidates.append(SimpleCandidateGroup(
                 group_id=group_id,
                 group_name=group.group_name,
                 score=group_scores[group_id],
+                facet_score=facet_score,
                 representative_comment_ids=group_examples.get(group_id, [])[:max_examples_per_group],
             ))
         return candidates
@@ -389,8 +470,11 @@ class SimpleHybridMemoryStore:
             source_group = self._groups[comment.group_id]
             if comment_id in source_group.member_comment_ids:
                 source_group.member_comment_ids.remove(comment_id)
+            update_facet_profile(source_group.facet_profile, comment.facets, delta=-1)
             comment.group_id = target_group_id
-            self._groups[target_group_id].member_comment_ids.append(comment_id)
+            target_group = self._groups[target_group_id]
+            target_group.member_comment_ids.append(comment_id)
+            update_facet_profile(target_group.facet_profile, comment.facets)
 
         for group_id in source_group_ids:
             group = self._groups.get(group_id)
@@ -427,6 +511,41 @@ class SimpleHybridMemoryStore:
             if len(examples) < max_examples_per_group and comment_id not in examples:
                 examples.append(comment_id)
 
+    def _accumulate_facet_scores(
+            self,
+            *,
+            query_facets: CommentFacets,
+            group_scores: dict[str, float],
+            exclude_group_ids: set[str],
+    ) -> None:
+        """Добавляет в рейтинг групп скоринг по совпадению фасетов.
+
+        Args:
+            query_facets: Фасеты текущего комментария.
+            group_scores: Накопленные scores групп.
+            exclude_group_ids: Идентификаторы групп, исключенных из выдачи.
+
+        Returns:
+            ``None``. Словарь ``group_scores`` изменяется на месте.
+        """
+        if query_facets.is_empty():
+            return
+
+        for group in self._groups.values():
+            if group.group_id in exclude_group_ids:
+                continue
+            facet_score = score_facets_against_profile(
+                query_facets,
+                group.facet_profile,
+                weights=self._facet_weights,
+            )
+            if facet_score <= 0:
+                continue
+            group_scores[group.group_id] = (
+                    group_scores.get(group.group_id, 0.0)
+                    + facet_score * self._facet_candidate_weight
+            )
+
     def rows_with_group_name(self) -> list[dict[str, Any]]:
         """Собирает строки результата в формате исходные поля плюс ``group_name``.
 
@@ -459,6 +578,10 @@ class SimpleHybridMemoryStore:
                 "group_id": group.group_id,
                 "group_name": group.group_name,
                 "comment_count": len(group.member_comment_ids),
+                "facet_profile": {
+                    facet_type: dict(counts)
+                    for facet_type, counts in group.facet_profile.items()
+                },
             }
             for group in self.all_groups()
         ]
@@ -567,6 +690,7 @@ class SimpleGroupDecisionEngine:
             *,
             raw_text: str,
             processed_text: str,
+            facets_text: str,
             candidate_groups_text: str,
             candidate_group_ids: set[str],
     ) -> SimpleGroupDecision:
@@ -575,6 +699,7 @@ class SimpleGroupDecisionEngine:
         Args:
             raw_text: Исходный текст комментария.
             processed_text: Предобработанный текст комментария.
+            facets_text: Текстовое описание фасетов комментария.
             candidate_groups_text: Текстовое описание групп-кандидатов.
             candidate_group_ids: Допустимые идентификаторы групп-кандидатов.
 
@@ -592,6 +717,7 @@ class SimpleGroupDecisionEngine:
                 raw = await self._invoke_once(
                     raw_text=raw_text,
                     processed_text=processed_text,
+                    facets_text=facets_text,
                     candidate_groups_text=candidate_groups_text,
                 )
                 return self._parse_decision(raw, candidate_group_ids)
@@ -658,6 +784,7 @@ class SimpleGroupDecisionEngine:
             *,
             raw_text: str,
             processed_text: str,
+            facets_text: str,
             candidate_groups_text: str,
     ) -> dict[str, Any]:
         """Один раз вызывает LLM-цепочку выбора группы.
@@ -665,6 +792,7 @@ class SimpleGroupDecisionEngine:
         Args:
             raw_text: Исходный текст комментария.
             processed_text: Предобработанный текст комментария.
+            facets_text: Текстовое описание фасетов комментария.
             candidate_groups_text: Текстовое описание групп-кандидатов.
 
         Returns:
@@ -674,6 +802,7 @@ class SimpleGroupDecisionEngine:
             return await self._chain.ainvoke({
                 "raw_text": raw_text,
                 "normalized_text": processed_text,
+                "facets": facets_text,
                 "candidate_groups": candidate_groups_text,
             })
 
@@ -692,6 +821,11 @@ class SimpleFaissBM25LLMClusteringPipeline:
         merge_small_groups: Если ``True``, запускает второй проход слияния маленьких групп.
         small_group_max_size: Максимальный размер группы, которую можно рассматривать для слияния.
         merge_candidate_group_limit: Максимальное количество групп-кандидатов для второго прохода.
+        facet_weights: Веса фасетов для мягкого скоринга похожести.
+        facet_candidate_weight: Вес фасетного score в общем рейтинге кандидатов.
+        auto_assign_min_score: Минимальный общий score для автоматического назначения без LLM.
+        auto_assign_min_facet_score: Минимальный score фасетов для автоматического назначения без LLM.
+        auto_assign_min_gap: Минимальный отрыв лучшего кандидата от второго для автоматического назначения.
         max_concurrent_llm_requests: Лимит параллельных LLM-запросов.
         max_llm_retries: Количество повторных попыток LLM-вызова после первой ошибки.
         max_embedding_retries: Количество повторных попыток batch embedding-вызова после первой ошибки.
@@ -715,6 +849,11 @@ class SimpleFaissBM25LLMClusteringPipeline:
             merge_small_groups: bool = True,
             small_group_max_size: int = 5,
             merge_candidate_group_limit: int = 40,
+            facet_weights: dict[str, float] | None = None,
+            facet_candidate_weight: float = 1.2,
+            auto_assign_min_score: float = 1.65,
+            auto_assign_min_facet_score: float = 0.72,
+            auto_assign_min_gap: float = 0.25,
             max_concurrent_llm_requests: int = 3,
             max_llm_retries: int = 1,
             max_embedding_retries: int = 1,
@@ -727,9 +866,13 @@ class SimpleFaissBM25LLMClusteringPipeline:
         self._merge_small_groups = merge_small_groups
         self._small_group_max_size = max(1, small_group_max_size)
         self._merge_candidate_group_limit = max(1, merge_candidate_group_limit)
+        self._auto_assign_min_score = max(0.0, auto_assign_min_score)
+        self._auto_assign_min_facet_score = max(0.0, auto_assign_min_facet_score)
+        self._auto_assign_min_gap = max(0.0, auto_assign_min_gap)
         self._embeddings = embeddings
         self._llm_sem = asyncio.Semaphore(max_concurrent_llm_requests)
         self._max_embedding_retries = max(0, max_embedding_retries)
+        self._stats = SimplePipelineStats()
         self._decision_engine = SimpleGroupDecisionEngine(
             llm,
             llm_semaphore=self._llm_sem,
@@ -740,6 +883,8 @@ class SimpleFaissBM25LLMClusteringPipeline:
             embeddings,
             bm25_top_k=bm25_top_k,
             faiss_top_k=faiss_top_k,
+            facet_weights=facet_weights,
+            facet_candidate_weight=facet_candidate_weight,
         )
         self._show_progress = show_progress
 
@@ -763,6 +908,7 @@ class SimpleFaissBM25LLMClusteringPipeline:
         Returns:
             Словарь с исходными строками и добавленным полем ``group_name``.
         """
+        self._stats = SimplePipelineStats()
         prepared = self._prepare_rows(raw_rows)
         total = len(prepared)
         self._print("Построение embeddings", 0, total)
@@ -785,6 +931,7 @@ class SimpleFaissBM25LLMClusteringPipeline:
         return {
             "rows": self._store.rows_with_group_name(),
             "groups": self._store.group_outputs(),
+            "stats": self._stats.to_dict(),
         }
 
     def to_dataframe(self, result: dict[str, Any]) -> Any:
@@ -846,6 +993,7 @@ class SimpleFaissBM25LLMClusteringPipeline:
                 "source": dict(row),
                 "raw_text": raw_text,
                 "processed_text": preprocess_text(raw_text),
+                "facets": extract_facets(raw_text),
             })
         return prepared
 
@@ -888,32 +1036,43 @@ class SimpleFaissBM25LLMClusteringPipeline:
         candidates = self._store.search_candidates(
             query_text=row["processed_text"],
             query_embedding=embedding,
+            query_facets=row["facets"],
             candidate_group_limit=self._candidate_group_limit,
             max_examples_per_group=self._max_examples,
         )
-        decision = await self._decision_engine.achoose_group(
-            raw_text=row["raw_text"],
-            processed_text=row["processed_text"],
-            candidate_groups_text=self._format_candidates(candidates),
-            candidate_group_ids={candidate.group_id for candidate in candidates},
-        )
 
-        if decision.decision_type == "existing_group":
-            group = self._store.get_group(decision.group_id)
-            if group is None:
-                raise ValueError(f"LLM выбрала несуществующую группу: {decision.group_id}.")
-            group_id = decision.group_id
+        auto_candidate = self._choose_auto_candidate(candidates)
+        if auto_candidate is not None:
+            group_id = auto_candidate.group_id
+            self._stats.auto_assignments += 1
         else:
-            group_id = self._create_group(decision)
+            self._stats.llm_decisions += 1
+            decision = await self._decision_engine.achoose_group(
+                raw_text=row["raw_text"],
+                processed_text=row["processed_text"],
+                facets_text=row["facets"].to_prompt_text(),
+                candidate_groups_text=self._format_candidates(candidates),
+                candidate_group_ids={candidate.group_id for candidate in candidates},
+            )
+
+            if decision.decision_type == "existing_group":
+                group = self._store.get_group(decision.group_id)
+                if group is None:
+                    raise ValueError(f"LLM выбрала несуществующую группу: {decision.group_id}.")
+                group_id = decision.group_id
+            else:
+                group_id = self._create_group(decision)
 
         self._store.add_comment(SimpleStoredComment(
             comment_id=row["comment_id"],
             source=row["source"],
             raw_text=row["raw_text"],
             processed_text=row["processed_text"],
+            facets=row["facets"],
             embedding=embedding,
             group_id=group_id,
         ))
+        self._stats.processed_rows += 1
 
     def _create_group(self, decision: SimpleGroupDecision) -> str:
         """Создает новую группу и возвращает ее идентификатор.
@@ -930,7 +1089,31 @@ class SimpleFaissBM25LLMClusteringPipeline:
         if not decision.group_name:
             raise ValueError("Для новой группы LLM должна вернуть непустое поле group_name.")
         group = self._store.create_group(decision.group_name)
+        self._stats.created_groups += 1
         return group.group_id
+
+    def _choose_auto_candidate(self, candidates: list[SimpleCandidateGroup]) -> SimpleCandidateGroup | None:
+        """Выбирает кандидата для автоматического назначения без LLM.
+
+        Args:
+            candidates: Ранжированный список групп-кандидатов.
+
+        Returns:
+            Лучший кандидат, если score и отрыв достаточно надежные, иначе ``None``.
+        """
+        if not candidates:
+            return None
+
+        best = candidates[0]
+        second_score = candidates[1].score if len(candidates) > 1 else 0.0
+        score_gap = best.score - second_score
+        if (
+                best.score >= self._auto_assign_min_score
+                and best.facet_score >= self._auto_assign_min_facet_score
+                and score_gap >= self._auto_assign_min_gap
+        ):
+            return best
+        return None
 
     def _format_candidates(self, candidates: list[SimpleCandidateGroup]) -> str:
         """Форматирует группы-кандидаты для LLM prompt-а.
@@ -949,8 +1132,14 @@ class SimpleFaissBM25LLMClusteringPipeline:
             lines.append(
                 f"group_id: {candidate.group_id} | "
                 f"group_name: {truncate_text(candidate.group_name, 120)} | "
-                f"retrieval_score: {candidate.score:.3f}"
+                f"retrieval_score: {candidate.score:.3f} | "
+                f"facet_score: {candidate.facet_score:.3f}"
             )
+            group = self._store.get_group(candidate.group_id)
+            if group is not None:
+                lines.append("  профиль_фасетов:")
+                for profile_line in format_facet_profile(group.facet_profile).splitlines():
+                    lines.append(f"    {profile_line}")
             for index, comment_id in enumerate(candidate.representative_comment_ids, start=1):
                 comment = self._store.get_comment(comment_id)
                 lines.append(f"  пример_{index}: {truncate_text(comment.raw_text)}")
@@ -977,10 +1166,24 @@ class SimpleFaissBM25LLMClusteringPipeline:
             if not candidates:
                 continue
 
+            auto_candidate = self._choose_auto_candidate(candidates)
+            if auto_candidate is not None:
+                current_group = self._store.get_group(group_id)
+                target_group = self._store.get_group(auto_candidate.group_id)
+                if current_group is not None and target_group is not None and target_group.group_id != current_group.group_id:
+                    self._store.move_comments_to_group(
+                        comment_ids=list(current_group.member_comment_ids),
+                        target_group_id=target_group.group_id,
+                    )
+                    self._stats.merge_auto_assignments += 1
+                continue
+
             merge_text = self._format_group_for_merge(group)
+            self._stats.merge_llm_decisions += 1
             decision = await self._decision_engine.achoose_group(
                 raw_text=merge_text,
                 processed_text=preprocess_text(merge_text),
+                facets_text=format_facet_profile(group.facet_profile),
                 candidate_groups_text=self._format_candidates(candidates),
                 candidate_group_ids={candidate.group_id for candidate in candidates},
             )
@@ -1011,6 +1214,7 @@ class SimpleFaissBM25LLMClusteringPipeline:
             candidates = self._store.search_candidates(
                 query_text=f"{group.group_name} {comment.processed_text}",
                 query_embedding=comment.embedding,
+                query_facets=comment.facets,
                 candidate_group_limit=self._merge_candidate_group_limit,
                 max_examples_per_group=self._max_examples,
                 exclude_group_ids={group.group_id},
@@ -1021,6 +1225,7 @@ class SimpleFaissBM25LLMClusteringPipeline:
                     candidates_by_group_id[candidate.group_id] = candidate
                     continue
                 existing.score += candidate.score
+                existing.facet_score = max(existing.facet_score, candidate.facet_score)
                 for representative_id in candidate.representative_comment_ids:
                     if (
                             representative_id not in existing.representative_comment_ids
