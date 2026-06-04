@@ -369,6 +369,21 @@ class SimpleHybridMemoryStore:
         """
         return self._groups.get(group_id)
 
+    def rename_group(self, group_id: str, group_name: str) -> None:
+        """Переименовывает существующую группу, если новое название непустое.
+
+        Args:
+            group_id: Идентификатор группы.
+            group_name: Новое человекочитаемое название группы.
+
+        Returns:
+            ``None``. Если группа не найдена или название пустое, состояние не меняется.
+        """
+        group = self._groups.get(group_id)
+        normalized_name = group_name.strip()
+        if group is not None and normalized_name:
+            group.group_name = normalized_name
+
     def all_groups(self) -> list[SimpleCommentGroup]:
         """Возвращает все группы в порядке создания.
 
@@ -1060,6 +1075,8 @@ class SimpleFaissBM25LLMClusteringPipeline:
                 if group is None:
                     raise ValueError(f"LLM выбрала несуществующую группу: {decision.group_id}.")
                 group_id = decision.group_id
+                if decision.group_name:
+                    self._store.rename_group(group_id, decision.group_name)
             else:
                 group_id = self._create_group(decision)
 
