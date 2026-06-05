@@ -6,6 +6,7 @@
 - ``normalize_for_match`` — нормализация строки для точного сравнения;
 - ``parse_decision_type`` — преобразование строкового решения LLM в enum;
 - ``truncate_text`` — сокращение длинного текста для prompt-ов и fallback-названий;
+- ``retry_async_operation`` — повтор асинхронных сетевых операций с задержкой;
 - ``CommentNormalizer`` — локальная проверка и нормализация комментария без LLM-вызова;
 - ``GroupDecisionEngine`` — LLM-выбор существующей или новой группы;
 - ``GroupNameGenerator`` — опциональный LLM-нейминг групп;
@@ -18,6 +19,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import re
+from collections.abc import Awaitable, Callable
+from typing import TypeVar
 
 from langchain_community.retrievers import BM25Retriever
 from langchain_community.vectorstores import FAISS
@@ -43,6 +46,7 @@ from .models import (
 )
 
 logger = logging.getLogger(__name__)
+T = TypeVar("T")
 
 # Таблица замены типографских символов на ASCII-аналоги
 _QUOTE_MAP = str.maketrans({
@@ -85,6 +89,49 @@ def truncate_text(value: str, limit: int = 10000) -> str:
     """Обрезает длинный текст для промптов и fallback-имён."""
     value = technical_normalize(value)
     return value if len(value) <= limit else value[: limit - 1].rstrip() + "…"
+
+
+async def retry_async_operation(
+        operation: Callable[[], Awaitable[T]],
+        *,
+        max_attempts: int,
+        base_delay: float,
+        operation_name: str,
+) -> T:
+    """Повторяет асинхронную сетевую операцию с экспоненциальной задержкой.
+
+    Args:
+        operation: Функция без аргументов, которая запускает асинхронную операцию.
+        max_attempts: Максимальное число попыток выполнения операции.
+        base_delay: Базовая задержка перед повтором в секундах.
+        operation_name: Название операции для диагностического лога.
+
+    Returns:
+        Результат успешного выполнения операции.
+
+    Raises:
+        Exception: Последняя ошибка операции, если все попытки завершились неуспешно.
+    """
+    attempts = max(1, max_attempts)
+    for attempt in range(1, attempts + 1):
+        try:
+            return await operation()
+        except Exception as exc:
+            if attempt >= attempts:
+                raise
+            delay = max(0.0, base_delay) * (2 ** (attempt - 1))
+            logger.warning(
+                "%s завершилась с ошибкой, повтор %d/%d через %.2f сек.: %s",
+                operation_name,
+                attempt + 1,
+                attempts,
+                delay,
+                exc,
+            )
+            if delay:
+                await asyncio.sleep(delay)
+
+    raise RuntimeError(f"{operation_name} не была выполнена")
 
 
 class CommentNormalizer:
@@ -135,6 +182,8 @@ class GroupDecisionEngine:
             llm: BaseChatModel,
             *,
             llm_semaphore: asyncio.Semaphore,
+            max_network_retries: int = 3,
+            retry_base_delay: float = 1.0,
             prompt_config: PrimaryPromptConfig | None = None,
     ):
         prompt_config = prompt_config or PrimaryPromptConfig.default()
@@ -147,6 +196,8 @@ class GroupDecisionEngine:
                 | JsonOutputParser()
         )
         self._sem = llm_semaphore
+        self._max_network_retries = max_network_retries
+        self._retry_base_delay = retry_base_delay
 
     async def achoose_group(
             self,
@@ -166,11 +217,16 @@ class GroupDecisionEngine:
             )
         try:
             async with self._sem:
-                raw = await self._chain.ainvoke({
-                    "raw_text": raw_text,
-                    "normalized_text": normalized_text,
-                    "candidate_groups": candidate_groups_text,
-                })
+                raw = await retry_async_operation(
+                    lambda: self._chain.ainvoke({
+                        "raw_text": raw_text,
+                        "normalized_text": normalized_text,
+                        "candidate_groups": candidate_groups_text,
+                    }),
+                    max_attempts=self._max_network_retries,
+                    base_delay=self._retry_base_delay,
+                    operation_name="LLM-решение о группе",
+                )
 
             decision_type = parse_decision_type(raw.get("decision_type"))
             group_id = str(raw.get("group_id", "")).strip()
@@ -195,6 +251,8 @@ class GroupNameGenerator:
             llm: BaseChatModel,
             *,
             llm_semaphore: asyncio.Semaphore,
+            max_network_retries: int = 3,
+            retry_base_delay: float = 1.0,
             prompt_config: PrimaryPromptConfig | None = None,
     ):
         prompt_config = prompt_config or PrimaryPromptConfig.default()
@@ -207,12 +265,19 @@ class GroupNameGenerator:
                 | JsonOutputParser()
         )
         self._sem = llm_semaphore
+        self._max_network_retries = max_network_retries
+        self._retry_base_delay = retry_base_delay
 
     async def agenerate_name(self, examples_text: str, fallback_name: str) -> str:
         """Генерирует короткое название группы по примерам комментариев."""
         try:
             async with self._sem:
-                raw = await self._chain.ainvoke({"group_examples": examples_text})
+                raw = await retry_async_operation(
+                    lambda: self._chain.ainvoke({"group_examples": examples_text}),
+                    max_attempts=self._max_network_retries,
+                    base_delay=self._retry_base_delay,
+                    operation_name="LLM-нейминг группы",
+                )
             if group_name := technical_normalize(raw.get("group_name", "")):
                 return group_name
         except Exception as exc:
@@ -445,6 +510,9 @@ class IncrementalMVPClusteringPipeline:
         primary_similarity_threshold: Порог fallback-назначения в ближайшую группу.
         max_concurrent_llm_requests: Лимит параллельных LLM-вызовов.
         max_concurrent_embedding_requests: Лимит параллельных embedding-вызовов.
+        max_network_retries: Максимальное число попыток для сетевых LLM/embedding-вызовов.
+        retry_base_delay: Базовая задержка между повторами сетевых вызовов в секундах.
+        preparation_batch_size: Размер пачки комментариев на этапе подготовки embeddings.
         generate_group_names: Если ``True``, запускает LLM-нейминг групп после кластеризации.
         merge_same_name_groups: Если ``True``, объединяет группы с одинаковыми названиями.
         show_progress: Если ``True``, печатает прогресс в консоль.
@@ -465,6 +533,9 @@ class IncrementalMVPClusteringPipeline:
             primary_similarity_threshold: float = 0.5,
             max_concurrent_llm_requests: int = 3,
             max_concurrent_embedding_requests: int = 3,
+            max_network_retries: int = 3,
+            retry_base_delay: float = 1.0,
+            preparation_batch_size: int = 50,
             generate_group_names: bool = True,
             merge_same_name_groups: bool = False,
             show_progress: bool = False,
@@ -474,6 +545,9 @@ class IncrementalMVPClusteringPipeline:
         self._embeddings = embeddings
         self._llm_sem = asyncio.Semaphore(max_concurrent_llm_requests)
         self._emb_sem = asyncio.Semaphore(max_concurrent_embedding_requests)
+        self._max_network_retries = max_network_retries
+        self._retry_base_delay = retry_base_delay
+        self._preparation_batch_size = max(1, preparation_batch_size)
         self._normalizer = CommentNormalizer(
             llm,
             min_meaningful_length=min_meaningful_length,
@@ -483,11 +557,15 @@ class IncrementalMVPClusteringPipeline:
         self._decision_engine = GroupDecisionEngine(
             llm,
             llm_semaphore=self._llm_sem,
+            max_network_retries=max_network_retries,
+            retry_base_delay=retry_base_delay,
             prompt_config=prompt_config,
         )
         self._name_generator = GroupNameGenerator(
             llm,
             llm_semaphore=self._llm_sem,
+            max_network_retries=max_network_retries,
+            retry_base_delay=retry_base_delay,
             prompt_config=prompt_config,
         )
         self._store = CommentMemoryStore(embeddings)
@@ -524,7 +602,7 @@ class IncrementalMVPClusteringPipeline:
         logger.info("Упрощенный pipeline запущен: %d комментариев", total)
 
         self._print("Подготовка embeddings", 0, total)
-        prepared = await asyncio.gather(*(self._prepare_comment(c) for c in comments))
+        prepared = await self._prepare_comments_in_batches(comments)
         self._print("Подготовка embeddings", total, total)
 
         self._print("Кластеризация", 0, total)
@@ -560,6 +638,24 @@ class IncrementalMVPClusteringPipeline:
         """
         await self.arun(raw_comments)
         return self._build_output(include_embeddings=True, include_group_id=True)
+
+    async def _prepare_comments_in_batches(
+            self,
+            comments: list[InputComment],
+    ) -> list[tuple[InputComment, NormalizationResult, list[float] | None]]:
+        """Подготавливает комментарии пачками, ограничивая число одновременно созданных задач.
+
+        Args:
+            comments: Валидированные входные комментарии для нормализации и построения embeddings.
+
+        Returns:
+            Список кортежей из комментария, результата нормализации и embedding-вектора.
+        """
+        prepared: list[tuple[InputComment, NormalizationResult, list[float] | None]] = []
+        for start in range(0, len(comments), self._preparation_batch_size):
+            batch = comments[start:start + self._preparation_batch_size]
+            prepared.extend(await asyncio.gather(*(self._prepare_comment(c) for c in batch)))
+        return prepared
 
     def _build_output(
             self,
@@ -657,7 +753,13 @@ class IncrementalMVPClusteringPipeline:
         """Генерирует векторное представление текста с ограничением параллелизма."""
         try:
             async with self._emb_sem:
-                return list(await self._embeddings.aembed_query(text))
+                embedding = await retry_async_operation(
+                    lambda: self._embeddings.aembed_query(text),
+                    max_attempts=self._max_network_retries,
+                    base_delay=self._retry_base_delay,
+                    operation_name="Генерация эмбеддинга",
+                )
+                return list(embedding)
         except Exception as exc:
             logger.error("Генерация эмбеддинга завершилась с ошибкой: %s", exc)
             return None
